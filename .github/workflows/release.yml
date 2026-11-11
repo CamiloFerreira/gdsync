@@ -1,0 +1,93 @@
+name: CI / Release
+
+# Cada push a main se valida. Si VERSION cambió (no existe el tag vX.Y.Z),
+# se compilan .deb + AppImage y se publica el release automáticamente.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Lint
+        run: |
+          bash -n gdsync gdsync-desktop packaging/*.sh
+          shellcheck -S error gdsync gdsync-desktop packaging/*.sh
+          python3 -m py_compile gdsync_app/*.py
+          python3 -c 'import json; d=json.load(open("release.json")); assert "min_supported" in d'
+          grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' VERSION
+
+      - name: Versión / ¿release nuevo?
+        id: v
+        run: |
+          V="$(cat VERSION)"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          if [[ "${{ github.event_name }}" != "pull_request" && "${{ github.ref }}" == "refs/heads/main" ]] \
+             && ! git rev-parse -q --verify "refs/tags/v$V" >/dev/null; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "Se publicará v$V"
+          else
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    needs: check
+    if: needs.check.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    env:
+      V: ${{ needs.check.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build .deb
+        run: bash packaging/build-deb.sh
+
+      - name: Build AppImage
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq file desktop-file-utils >/dev/null
+          bash packaging/build-appimage.sh
+
+      - name: update.json + SHA256SUMS
+        run: bash packaging/make-update-json.sh && cat dist/update.json
+
+      - name: Probar instalación del .deb
+        run: |
+          sudo apt-get install -y -qq ./dist/gdsync_${V}_all.deb >/dev/null
+          gdsync version
+          python3 -c 'import sys; sys.path.insert(0,"/usr/lib/gdsync"); import gdsync_app.core, gdsync_app.updater as u; print(u.install_kind())'
+
+      - name: Publicar release
+        run: |
+          ADVISORY="$(python3 -c 'import json; print(json.load(open("release.json")).get("advisory",""))')"
+          NOTES=""
+          if [[ -n "$ADVISORY" ]]; then
+            NOTES="> [!CAUTION]
+          > **Actualización de seguridad.** $ADVISORY"
+          fi
+          gh release create "v$V" \
+            --title "gdsync $V" \
+            --target "$GITHUB_SHA" \
+            --generate-notes \
+            --notes "$NOTES" \
+            dist/gdsync_${V}_all.deb \
+            dist/gdsync-${V}-x86_64.AppImage \
+            dist/update.json \
+            dist/SHA256SUMS

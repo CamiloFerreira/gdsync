@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Lanzador de la app de escritorio gdsync
+DIR="$(dirname "$(readlink -f "$0")")"
+PYTHONPATH="$DIR${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m gdsync_app "$@"
