@@ -83,9 +83,18 @@ def read_config() -> dict:
     return cfg
 
 
+def _write_private(path: Path, text: str) -> None:
+    """Escritura atómica con permisos 0600."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f".{path.name}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
 def write_config(cfg: dict) -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text("".join(f"{k}={shlex.quote(str(cfg.get(k, '')))}\n" for k in CONFIG_KEYS))
+    _write_private(CONFIG_FILE, "".join(f"{k}={shlex.quote(str(cfg.get(k, '')))}\n" for k in CONFIG_KEYS))
 
 
 def is_configured(cfg: dict | None = None) -> bool:
@@ -94,7 +103,31 @@ def is_configured(cfg: dict | None = None) -> bool:
 
 
 def valid_remote_name(name: str) -> bool:
-    return bool(name) and len(name) <= 64 and all(c.isalnum() or c in "-_" for c in name)
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name or ""))
+
+
+# Subcarpetas de HOME que nunca deben sincronizarse (configuración / credenciales)
+SENSITIVE_HOME_DIRS = (".ssh", ".gnupg", ".pki", ".config", ".local", ".cache", ".mozilla",
+                       "snap", ".var", ".password-store")
+MOUNT_ROOTS = ("/media", "/mnt", "/run/media")
+
+
+def check_local_path(path: str) -> str:
+    """Devuelve la ruta normalizada o lanza CoreError. Mismas reglas que el CLI."""
+    if not path or "\n" in path or "\0" in path:
+        raise CoreError("Ruta local inválida")
+    path = os.path.expanduser(path.strip())
+    if not os.path.isabs(path):
+        raise CoreError("La carpeta local debe ser una ruta absoluta")
+    real = Path(os.path.realpath(path))
+    home = Path(os.path.realpath(HOME))
+    in_home = home in real.parents
+    in_mount = any(Path(m) in real.parents and real != Path(m) for m in MOUNT_ROOTS)
+    if not (in_home or in_mount):
+        raise CoreError(f"La carpeta local debe estar dentro de {home} o en un disco montado (/media, /mnt)")
+    if in_home and real.relative_to(home).parts[0] in SENSITIVE_HOME_DIRS:
+        raise CoreError("No se puede sincronizar una carpeta de configuración o credenciales")
+    return path
 
 
 def save_config(remote: str, remote_path: str, local_path: str, interval: str) -> str:
@@ -106,14 +139,12 @@ def save_config(remote: str, remote_path: str, local_path: str, interval: str) -
         raise CoreError("Elige una carpeta de Drive (no la raíz)")
     if ".." in remote_path.split("/"):
         raise CoreError("Ruta remota inválida")
-    lp = os.path.expanduser(local_path.strip())
-    if not lp or not os.path.isabs(lp):
-        raise CoreError("La carpeta local debe ser una ruta absoluta")
-    if os.path.realpath(lp) in (str(HOME), "/"):
-        raise CoreError("No uses tu carpeta personal ni / como carpeta de sincronización")
-    if not re.fullmatch(r"\d+(s|min|h|d)", interval):
+    if "\n" in remote_path:
+        raise CoreError("Ruta remota inválida")
+    lp = check_local_path(local_path)
+    if not re.fullmatch(r"\d{1,5}(s|min|h|d)", interval):
         raise CoreError("Intervalo inválido")
-    Path(lp).mkdir(parents=True, exist_ok=True)
+    Path(lp).mkdir(parents=True, exist_ok=True, mode=0o700)
     cfg = {"REMOTE_NAME": remote, "REMOTE_PATH": remote_path, "LOCAL_PATH": lp, "INTERVAL": interval}
     write_config(cfg)
 
@@ -144,8 +175,9 @@ def save_filters(text: str) -> None:
         s = line.strip()
         if s and not s.startswith("#") and s[:2] not in ("- ", "+ "):
             raise CoreError(f"Línea {i}: debe empezar por «- », «+ » o «#»")
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    FILTERS_FILE.write_text(text if not text or text.endswith("\n") else text + "\n")
+    if "\0" in text:
+        raise CoreError("Texto inválido")
+    _write_private(FILTERS_FILE, text if not text or text.endswith("\n") else text + "\n")
     reset_bisync_state()
 
 
@@ -198,6 +230,8 @@ def list_dirs(remote: str, path: str) -> dict:
 
 
 def delete_remote(name: str) -> None:
+    if not valid_remote_name(name):
+        raise CoreError("Cuenta inválida")
     cfg = read_config()
     if name == cfg["REMOTE_NAME"] and cfg["REMOTE_PATH"]:
         raise CoreError("Esa cuenta está en uso por la sincronización")
@@ -241,6 +275,14 @@ def parse_systemd_time(v: str | None) -> datetime | None:
 
 # --------------------------------------------------------------- autostart
 
+def desktop_exec_quote(path: str) -> str:
+    """Cita una ruta para la clave Exec= de un .desktop (spec freedesktop)."""
+    if re.fullmatch(r"[A-Za-z0-9/._+-]+", path):
+        return path
+    escaped = "".join("\\" + c if c in '"`$\\' else c for c in path).replace("%", "%%")
+    return f'"{escaped}"'
+
+
 def autostart_enabled() -> bool:
     return AUTOSTART_FILE.exists()
 
@@ -252,7 +294,7 @@ def set_autostart(enabled: bool, exec_cmd: str) -> None:
     AUTOSTART_FILE.parent.mkdir(parents=True, exist_ok=True)
     AUTOSTART_FILE.write_text(
         "[Desktop Entry]\nType=Application\nName=Google Drive Sync\n"
-        f"Exec={exec_cmd} --background\nIcon={ICONS_DIR / 'hicolor/scalable/apps/io.github.gdsync.svg'}\n"
+        f"Exec={desktop_exec_quote(exec_cmd)} --background\nIcon=io.github.gdsync\n"
         "X-GNOME-Autostart-enabled=true\nNoDisplay=true\n"
     )
 

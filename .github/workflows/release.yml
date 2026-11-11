@@ -8,8 +8,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Por defecto solo lectura; solo el job que publica puede escribir.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -18,13 +19,15 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.v.outputs.version }}
       release: ${{ steps.v.outputs.release }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Lint
         run: |
@@ -34,12 +37,15 @@ jobs:
           python3 -c 'import json; d=json.load(open("release.json")); assert "min_supported" in d'
           grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' VERSION
 
+      - name: Tests
+        run: python3 -m unittest discover -s tests -v
+
       - name: Versión / ¿release nuevo?
         id: v
         run: |
           V="$(cat VERSION)"
           echo "version=$V" >> "$GITHUB_OUTPUT"
-          if [[ "${{ github.event_name }}" != "pull_request" && "${{ github.ref }}" == "refs/heads/main" ]] \
+          if [[ "$GITHUB_EVENT_NAME" != "pull_request" && "$GITHUB_REF" == "refs/heads/main" ]] \
              && ! git rev-parse -q --verify "refs/tags/v$V" >/dev/null; then
             echo "release=true" >> "$GITHUB_OUTPUT"
             echo "Se publicará v$V"
@@ -51,11 +57,16 @@ jobs:
     needs: check
     if: needs.check.outputs.release == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
     env:
       V: ${{ needs.check.outputs.version }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Build .deb
         run: bash packaging/build-deb.sh

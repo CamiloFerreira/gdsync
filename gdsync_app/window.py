@@ -113,10 +113,10 @@ class MainWindow(Adw.ApplicationWindow):
 
     def show_update_banner(self, info, mandatory: bool):
         if mandatory:
-            self.banner.set_title(f"Actualización de seguridad obligatoria: {info.current} → {info.latest}")
+            self.banner.set_title(GLib.markup_escape_text(f"Actualización de seguridad obligatoria: {info.current} → {info.latest}"))
             self.banner.add_css_class("error")
         else:
-            self.banner.set_title(f"Nueva versión disponible: {info.latest}")
+            self.banner.set_title(GLib.markup_escape_text(f"Nueva versión disponible: {info.latest}"))
             self.banner.remove_css_class("error")
         self.banner.set_button_label("Actualizar")
         self.banner.set_revealed(True)

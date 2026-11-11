@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
 import shutil
 import subprocess
 import sys
@@ -240,12 +239,13 @@ class App(Adw.Application):
             self.refresh()
 
     def launch_command(self) -> str:
+        """Ruta (sin citar) del ejecutable que relanza esta instalación."""
         if os.environ.get("APPIMAGE"):
-            return shlex.quote(os.environ["APPIMAGE"])
+            return os.environ["APPIMAGE"]
         if updater.install_kind() == "deb":
             return "/usr/bin/gdsync-desktop"
         launcher = shutil.which("gdsync-desktop", path=core.ENV["PATH"])
-        return launcher or f"{shlex.quote(str(core.PROJECT_DIR / 'gdsync-desktop'))}"
+        return launcher or str(core.PROJECT_DIR / "gdsync-desktop")
 
     def set_autostart(self, enabled: bool):
         core.set_autostart(enabled, self.launch_command())
@@ -322,7 +322,7 @@ class App(Adw.Application):
             self.notify("gdsync actualizado", f"Versión {info.latest} instalada. Reiniciando…")
             if cmd:
                 # Relanzar cuando esta instancia haya salido (instancia única)
-                subprocess.Popen(["sh", "-c", f"sleep 1.5; exec {cmd} </dev/null >/dev/null 2>&1"],
+                subprocess.Popen(["sh", "-c", 'sleep 1.5; exec "$0" </dev/null >/dev/null 2>&1', cmd],
                                  start_new_session=True)
             self.quit_app()
 

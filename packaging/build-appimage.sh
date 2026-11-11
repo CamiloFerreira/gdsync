@@ -42,9 +42,15 @@ cat > "$APPDIR/usr/share/metainfo/$APP_ID.appdata.xml" <<EOF
 </component>
 EOF
 
-TOOL="${APPIMAGETOOL:-$ROOT/build/appimagetool}"
+# appimagetool fijado a una versión y verificado por SHA-256 (cadena de suministro)
+AIT_VERSION="1.9.1"
+AIT_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+TOOL="${APPIMAGETOOL:-$ROOT/build/appimagetool-$AIT_VERSION}"
 if [[ ! -x "$TOOL" ]]; then
-  curl -fsSL -o "$TOOL" "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+  curl -fsSL --proto '=https' -o "$TOOL.part" \
+    "https://github.com/AppImage/appimagetool/releases/download/$AIT_VERSION/appimagetool-x86_64.AppImage"
+  echo "$AIT_SHA256  $TOOL.part" | sha256sum -c --quiet - || { rm -f "$TOOL.part"; echo "appimagetool: SHA-256 no coincide" >&2; exit 1; }
+  mv "$TOOL.part" "$TOOL"
   chmod +x "$TOOL"
 fi
 OUT="$DIST/gdsync-${VERSION}-x86_64.AppImage"

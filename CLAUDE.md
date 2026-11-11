@@ -6,13 +6,17 @@ gdsync syncs **one** Google Drive folder with a local folder on Linux. It has th
 
 ## Commands
 
-There is no test suite. CI (`.github/workflows/release.yml`) runs these lint commands:
+CI (`.github/workflows/release.yml`) runs lint and tests before anything is released:
 
 ```bash
 bash -n gdsync gdsync-desktop packaging/*.sh
 shellcheck -S error gdsync gdsync-desktop packaging/*.sh
 python3 -m py_compile gdsync_app/*.py
+python3 -m unittest discover -s tests -v                                 # all tests (no GTK needed)
+python3 -m unittest tests.test_hardening.TestUpdater.test_apply_refuses_downgrade   # single test
 ```
+
+`tests/test_hardening.py` redirects HOME/XDG dirs to a temp dir and puts a fake `systemctl` on PATH. It tests Bash functions by extracting them from `gdsync` with `sed -n '/^name()/,/^}/p'`, so keep each Bash function's closing `}` at column 0. Tests must never reach the real systemd user manager or the user's config.
 
 Run from source:
 
@@ -66,9 +70,19 @@ Shared state, read and written by both sides:
   - For a security fix, set `min_supported` to the new `VERSION`. `make-update-json.sh` fails if `min_supported` is greater than `VERSION`.
 - The updater only accepts asset URLs under `https://github.com/CamiloFerreira/gdsync/releases/download/` and checks SHA-256 before installing. The AppImage replaces itself atomically; the .deb is installed with `pkexec apt-get install`. After an update, the app relaunches through a detached `sh -c "sleep 1.5; exec …"` so the single-instance lock is free.
 
+## Security invariants (covered by tests — keep them)
+
+- The CLI **never `source`s the config**. `load_config` parses it with Python `shlex` and accepts only the known keys. `save_config` (bash `squote`) and `core.write_config` (`shlex.quote`) must stay format-compatible.
+- `check_local_path` (bash) and `core.check_local_path` (Python) implement the same rule. The local folder must be inside HOME, or under `/media`, `/mnt` or `/run/media`. It can never be HOME itself, and never a config or credentials dir (`.ssh`, `.gnupg`, `.config`, `.local`, …). Symlinks are resolved before the check. If you change one implementation, change the other too.
+- Everything written into systemd units goes through `validate_config` and `sd_escape`. `%` and `$` are systemd specifiers.
+- Config and filters are written atomically with mode 0600; the CLI runs with `umask 077`.
+- `gdsync install-rclone` pins the version from `version.txt` and verifies the zip against rclone's `SHA256SUMS`.
+- The updater refuses downgrades. An asset URL must sit under this repo's `releases/download/v<announced version>/`, and its SHA-256 must match. Cached and remote `update.json` files are validated before use.
+- CI: the default token permission is read-only, actions are pinned by commit SHA, and appimagetool is pinned to a version with its SHA-256 (`packaging/build-appimage.sh`). When you bump either one, update the hash as well.
+
 ## Conventions
 
-- Validate user input in `core` before it reaches rclone: remote names go through `valid_remote_name`, and Drive paths may not contain `..`. Never pass rclone config secrets to the UI; `list_remotes` returns only the name and type.
+- Never pass rclone config secrets to the UI; `list_remotes` returns only the name and type.
 - rclone lives in `~/.local/bin` (installed by `gdsync install-rclone`, minimum `RCLONE_MIN=1.66.0`). Distro packages are too old for the bisync flags we use. `core.ENV` prepends `~/.local/bin` to `PATH` for every subprocess.
 - Adw rows treat titles and subtitles as markup, so wrap dynamic text in `GLib.markup_escape_text`.
 - Target platform is GTK 4.14 and libadwaita 1.5 (Ubuntu 24.04). Don't use APIs newer than these.
