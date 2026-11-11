@@ -62,7 +62,8 @@ jobs:
 
       - name: Build AppImage
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq file desktop-file-utils >/dev/null
+          # Opcional (validación del .desktop); la red del runner a veces falla
+          for i in 1 2 3; do sudo apt-get update -qq && sudo apt-get install -y -qq file desktop-file-utils >/dev/null && break; sleep 15; done || true
           bash packaging/build-appimage.sh
 
       - name: update.json + SHA256SUMS
@@ -70,7 +71,7 @@ jobs:
 
       - name: Probar instalación del .deb
         run: |
-          sudo apt-get install -y -qq ./dist/gdsync_${V}_all.deb >/dev/null
+          for i in 1 2 3; do sudo apt-get update -qq; sudo apt-get install -y -qq ./dist/gdsync_${V}_all.deb >/dev/null && break; sleep 20; done
           gdsync version
           python3 -c 'import sys; sys.path.insert(0,"/usr/lib/gdsync"); import gdsync_app.core, gdsync_app.updater as u; print(u.install_kind())'
 
