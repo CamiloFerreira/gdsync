@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
 # Lanzador de la app de escritorio gdsync
 DIR="$(dirname "$(readlink -f "$0")")"
-PYTHONPATH="$DIR${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m gdsync_app "$@"
+# cd: python -m antepone el directorio actual a sys.path; así siempre carga esta copia
+cd "$DIR" && exec python3 -m gdsync_app "$@"

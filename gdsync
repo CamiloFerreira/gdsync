@@ -286,7 +286,7 @@ APP_ID="io.github.gdsync"
 
 cmd_ui() {
   [[ -d "$SELF_DIR/gdsync_app" ]] || die "No encuentro la app ($SELF_DIR/gdsync_app)"
-  PYTHONPATH="$SELF_DIR${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m gdsync_app "$@"
+  cd "$SELF_DIR" && exec python3 -m gdsync_app "$@"
 }
 
 cmd_desktop() {

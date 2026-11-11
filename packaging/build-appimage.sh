@@ -19,8 +19,7 @@ if ! python3 -c 'import gi; gi.require_version("Gtk","4.0"); gi.require_version(
   echo "$MSG" >&2
   exit 1
 fi
-export PYTHONPATH="$LIB${PYTHONPATH:+:$PYTHONPATH}"
-exec python3 -m gdsync_app "$@"
+cd "$LIB" && exec python3 -m gdsync_app "$@"
 EOF
 chmod 755 "$APPDIR/AppRun"
 
