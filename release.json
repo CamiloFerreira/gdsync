@@ -1,4 +1,4 @@
 {
-  "min_supported": "1.0.0",
-  "advisory": ""
+  "min_supported": "1.0.1",
+  "advisory": "Corrige ejecución de código vía archivo de configuración, descarga de rclone sin verificar, posibilidad de sincronizar carpetas de credenciales (~/.ssh, ~/.config), inyección en units de systemd y validación del actualizador. Actualizar es obligatorio."
 }
