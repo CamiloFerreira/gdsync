@@ -272,17 +272,29 @@ class MainWindow(Adw.ApplicationWindow):
 
         # -- vista sin configurar
         empty = Adw.StatusPage(icon_name="io.github.gdsync", title="Bienvenido",
-                               description="Elige una carpeta de tu Google Drive para mantenerla sincronizada con este equipo.")
+                               description="Tres pasos para mantener tu Google Drive sincronizado con este equipo.")
         self.empty_page = empty
-        b = Gtk.Button(label="Elegir carpeta", css_classes=["pill", "suggested-action"], halign=Gtk.Align.CENTER)
-        b.connect("clicked", lambda *_: self.stack.set_visible_child_name("folder"))
-        self.b_install = Gtk.Button(label="Instalar rclone", css_classes=["pill", "suggested-action"], halign=Gtk.Align.CENTER, visible=False)
-        self.b_install.connect("clicked", lambda *_: self.app.start_job("install-rclone"))
-        self.b_choose = b
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        box.append(b)
-        box.append(self.b_install)
-        empty.set_child(box)
+        steps = Adw.PreferencesGroup()
+        self.setup_steps = []
+        for n, (title, sub, label, cb) in enumerate((
+                ("Instalar rclone", "El motor de sincronización. Se instala en ~/.local/bin, sin contraseña de administrador.",
+                 "Instalar", lambda *_: self.app.start_job("install-rclone")),
+                ("Conectar tu Google Drive", "Se abrirá el navegador para que autorices el acceso.",
+                 "Conectar", lambda *_: self._add_account(default_name="gdrive")),
+                ("Elegir qué sincronizar", "Una carpeta de tu Drive o todo tu Drive, y dónde guardarlo en este equipo.",
+                 "Elegir", lambda *_: self.stack.set_visible_child_name("folder"))), 1):
+            row = Adw.ActionRow(title=title, subtitle=sub, subtitle_lines=2)
+            num = Gtk.Label(label=str(n), css_classes=["title-4", "dim-label"], width_chars=2)
+            done_icon = Gtk.Image(icon_name="object-select-symbolic", css_classes=["success"], visible=False)
+            b = Gtk.Button(label=label, valign=Gtk.Align.CENTER)
+            b.connect("clicked", cb)
+            row.add_prefix(num)
+            row.add_suffix(done_icon)
+            row.add_suffix(b)
+            steps.add(row)
+            self.setup_steps.append((row, done_icon, b))
+        clamp = Adw.Clamp(child=steps, maximum_size=560)
+        empty.set_child(clamp)
         self.status_stack.add_named(empty, "setup")
 
         self.stack.add_titled_with_icon(self.status_stack, "status", "Estado", "gdsync-tray-ok-symbolic")
@@ -307,12 +319,14 @@ class MainWindow(Adw.ApplicationWindow):
         c = st.config
         if not st.rclone or not st.configured:
             self.status_stack.set_visible_child_name("setup")
-            self.b_install.set_visible(not st.rclone)
-            self.b_choose.set_visible(bool(st.rclone))
-            self.empty_page.set_description(
-                "rclone no está instalado. Lo instalamos en ~/.local/bin sin permisos de administrador."
-                if not st.rclone else
-                "Elige una carpeta de tu Google Drive para mantenerla sincronizada con este equipo.")
+            done = [bool(st.rclone), bool(st.rclone and st.has_account), False]
+            current = done.index(False)
+            for i, (row, icon, b) in enumerate(self.setup_steps):
+                icon.set_visible(done[i])
+                b.set_visible(not done[i])
+                b.set_sensitive(i == current and not job_running and self.app.job is None)
+                b.set_css_classes(["suggested-action"] if i == current else [])
+                row.set_sensitive(i <= current)
             return
         self.status_stack.set_visible_child_name("main")
         state = "syncing" if job_running else st.state
@@ -456,7 +470,11 @@ class MainWindow(Adw.ApplicationWindow):
             self.remote_model.splice(0, self.remote_model.get_n_items(), names)
             if not names:
                 self._clear_folder_rows()
-                self._add_folder_row(Adw.ActionRow(title="No hay cuentas", subtitle="Añade una en Ajustes → Cuentas"))
+                row = Adw.ActionRow(title="No hay ninguna cuenta de Google Drive conectada")
+                b = Gtk.Button(label="Conectar", valign=Gtk.Align.CENTER, css_classes=["suggested-action"])
+                b.connect("clicked", lambda *_: self._add_account(default_name="gdrive"))
+                row.add_suffix(b)
+                self._add_folder_row(row)
                 return
             sel = names.index(cfg["REMOTE_NAME"]) if cfg["REMOTE_NAME"] in names else 0
             self.row_remote.set_selected(sel)
@@ -846,10 +864,10 @@ class MainWindow(Adw.ApplicationWindow):
                        f"{t} · {core.fmt_bytes(q.get('used'))} de {core.fmt_bytes(q.get('total'))}" if q.get("total") else t))
         bg(core.list_remotes, done, self.error)
 
-    def _add_account(self, *_):
+    def _add_account(self, *_, default_name: str = ""):
         dlg = Adw.AlertDialog(heading="Conectar Google Drive",
                               body="Ponle un nombre. Se abrirá el navegador para que autorices el acceso.")
-        entry = Gtk.Entry(placeholder_text="ej: trabajo", activates_default=True)
+        entry = Gtk.Entry(placeholder_text="ej: trabajo", activates_default=True, text=default_name)
         dlg.set_extra_child(entry)
         dlg.add_response("cancel", "Cancelar")
         dlg.add_response("ok", "Conectar")

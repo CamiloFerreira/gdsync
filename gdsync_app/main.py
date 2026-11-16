@@ -226,7 +226,9 @@ class App(Adw.Application):
             return
         self.win.append_lines([f"▶ {JOB_TITLES.get(kind, kind)}"], scroll=True)
         self.win.set_job(JOB_TITLES.get(kind, kind))
-        if kind in ("dry-run", "add-remote", "install-rclone", "reauth"):
+        configured = bool(self.status and self.status.configured)
+        # En la configuración inicial nos quedamos en Estado, que muestra los pasos
+        if kind == "dry-run" or (configured and kind in ("add-remote", "install-rclone", "reauth")):
             self.win.stack.set_visible_child_name("activity")
         # sync/resync: rclone escribe en sync.log, que ya seguimos; evitamos duplicar.
         quiet = kind in ("sync", "resync")

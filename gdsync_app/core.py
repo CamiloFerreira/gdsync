@@ -476,6 +476,7 @@ class Status:
     last_sync: datetime | None = None
     last_ok: bool | None = None
     paused_until: datetime | None = None
+    has_account: bool = False
     problem: "Diagnosis | None" = None
     shared_client_id: bool = False
 
@@ -598,6 +599,8 @@ def get_status() -> Status:
         service_failed=s.get("Result") not in (None, "", "success"),
         initialized=bisync_initialized(),
     )
+    if st.rclone and not st.configured:
+        st.has_account = any(r["type"] == "drive" for r in list_remotes())
     if st.timer_enabled and t.get("ActiveState") == "inactive":
         rt = systemd_props(f"{RESUME_UNIT}.timer", ["ActiveState", "NextElapseUSecRealtime"])
         if rt.get("ActiveState") == "active":
