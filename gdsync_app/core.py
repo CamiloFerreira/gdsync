@@ -44,6 +44,10 @@ DEFAULT_FILTERS = """# Reglas de exclusión rclone (https://rclone.org/filtering
 - Thumbs.db
 - desktop.ini
 - .Trash-*/**
+# Restos de Google Drive para escritorio (Windows/macOS)
+- .sync-exclude.lst
+- .tmp.drivedownload/**
+- .tmp.driveupload/**
 """
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -151,12 +155,15 @@ def save_config(remote: str, remote_path: str, local_path: str, interval: str) -
     lp = check_local_path(local_path)
     if not re.fullmatch(r"\d{1,5}(s|min|h|d)", interval):
         raise CoreError("Intervalo inválido")
-    Path(lp).mkdir(parents=True, exist_ok=True, mode=0o700)
     cfg = {"REMOTE_NAME": remote, "REMOTE_PATH": remote_path, "LOCAL_PATH": lp, "INTERVAL": interval}
+    target_changed = any(old[k] != cfg[k] for k in ("REMOTE_NAME", "REMOTE_PATH", "LOCAL_PATH"))
+    if target_changed and sync_in_progress():
+        raise CoreError(BUSY_MSG)
+    Path(lp).mkdir(parents=True, exist_ok=True, mode=0o700)
     write_config(cfg)
 
     msgs = ["Configuración guardada"]
-    if any(old[k] != cfg[k] for k in ("REMOTE_NAME", "REMOTE_PATH", "LOCAL_PATH")):
+    if target_changed:
         reset_bisync_state()
         msgs.append("el próximo sync unirá ambos lados")
     if timer_enabled() and old["INTERVAL"] != interval:
@@ -164,7 +171,37 @@ def save_config(remote: str, remote_path: str, local_path: str, interval: str) -
     return " · ".join(msgs)
 
 
+def _pid_alive(pid) -> bool:
+    try:
+        pid = int(pid)
+        os.kill(pid, 0)
+    except (TypeError, ValueError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True
+    return pid > 0
+
+
+def sync_in_progress() -> bool:
+    """True si hay un bisync corriendo: unit systemd activa o lock de rclone con PID vivo."""
+    if systemd_props(f"{APP}.service", ["ActiveState"]).get("ActiveState") in ("activating", "deactivating"):
+        return True
+    for lck in (STATE_DIR / "bisync").glob("*.lck"):
+        try:
+            if _pid_alive(json.loads(lck.read_text()).get("PID")):
+                return True
+        except (OSError, ValueError, AttributeError):
+            continue
+    return False
+
+
+BUSY_MSG = "Hay una sincronización en curso. Espera a que termine (o cancélala) y vuelve a guardar."
+
+
 def reset_bisync_state() -> None:
+    # Borrar el workdir con un bisync en marcha lo deja inconsistente
+    if sync_in_progress():
+        raise CoreError(BUSY_MSG)
     shutil.rmtree(STATE_DIR / "bisync", ignore_errors=True)
 
 
@@ -184,6 +221,8 @@ def save_filters(text: str) -> None:
             raise CoreError(f"Línea {i}: debe empezar por «- », «+ » o «#»")
     if "\0" in text:
         raise CoreError("Texto inválido")
+    if sync_in_progress():
+        raise CoreError(BUSY_MSG)
     _write_private(FILTERS_FILE, text if not text or text.endswith("\n") else text + "\n")
     reset_bisync_state()
 

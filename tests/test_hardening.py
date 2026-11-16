@@ -121,6 +121,51 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(core.desktop_exec_quote('/x/a b$"%'), '"/x/a b\\$\\"%%"')
 
 
+class TestBusyGuard(unittest.TestCase):
+    """Con un bisync en marcha no se puede borrar su workdir (config/filtros)."""
+
+    def setUp(self):
+        self.wd = core.STATE_DIR / "bisync"
+        self.wd.mkdir(parents=True, exist_ok=True)
+        (self.wd / "x.path1.lst").write_text("")
+        core.write_config({"REMOTE_NAME": "gdrive", "REMOTE_PATH": "X", "LOCAL_PATH": str(HOME / "D"), "INTERVAL": "5min"})
+
+    def tearDown(self):
+        for f in self.wd.glob("*"):
+            f.unlink()
+
+    def lock(self, pid):
+        (self.wd / "x.lck").write_text(json.dumps({"PID": str(pid)}))
+
+    def test_live_lock_blocks_changes(self):
+        self.lock(os.getpid())
+        self.assertTrue(core.sync_in_progress())
+        with self.assertRaises(core.CoreError):
+            core.save_filters("- *.tmp\n")
+        with self.assertRaises(core.CoreError):
+            core.save_config("gdrive", "Y", str(HOME / "D"), "5min")
+        self.assertEqual(core.read_config()["REMOTE_PATH"], "X")
+        self.assertTrue((self.wd / "x.path1.lst").exists())
+        # Cambiar solo el intervalo no toca el workdir: se permite
+        core.save_config("gdrive", "X", str(HOME / "D"), "10min")
+
+    def test_stale_lock_is_ignored(self):
+        p = subprocess.Popen(["true"])
+        p.wait()
+        self.lock(p.pid)
+        self.assertFalse(core.sync_in_progress())
+        core.save_filters("- *.tmp\n")
+        self.assertFalse((self.wd / "x.path1.lst").exists())
+
+    def test_bash_sync_running(self):
+        src = (f"source <(sed -n '/^sync_running()/,/^}}/p' {GDSYNC}); "
+               f"APP=gdsync; STATE_DIR={core.STATE_DIR}; sync_running")
+        self.lock(os.getpid())
+        self.assertEqual(subprocess.run(["bash", "-c", src]).returncode, 0)
+        self.lock(999999999)
+        self.assertNotEqual(subprocess.run(["bash", "-c", src]).returncode, 0)
+
+
 class TestCLI(unittest.TestCase):
     def setUp(self):
         for unit in ("gdsync.service", "gdsync.timer"):

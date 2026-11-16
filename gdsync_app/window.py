@@ -60,6 +60,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.folder_rows: list[Gtk.Widget] = []
         self.remote_rows: list[Gtk.Widget] = []
         self._ls_token = 0
+        self._busy = False  # hay un sync en marcha: no se puede tocar config/filtros
 
         provider = Gtk.CssProvider()
         provider.load_from_string(CSS)
@@ -234,6 +235,11 @@ class MainWindow(Adw.ApplicationWindow):
 
     def update_status(self, st: core.Status, job_running: bool):
         self.status = st
+        if job_running != self._busy:
+            self._busy = job_running
+            self._check_dirty()
+            self.b_fs.set_sensitive(not job_running)
+            self.b_fs.set_tooltip_text(core.BUSY_MSG if job_running else "Guardar reglas")
         c = st.config
         if not st.rclone or not st.configured:
             self.status_stack.set_visible_child_name("setup")
@@ -456,11 +462,13 @@ class MainWindow(Adw.ApplicationWindow):
         dirty = bool(self.picked) and (
             self.picked != (cfg["REMOTE_NAME"], cfg["REMOTE_PATH"]) or self.local_path != cfg["LOCAL_PATH"]
             or self._interval() != cfg["INTERVAL"])
-        self.b_save.set_sensitive(dirty and bool(self.local_path))
         target_changed = bool(self.picked) and cfg["REMOTE_PATH"] and (
             self.picked != (cfg["REMOTE_NAME"], cfg["REMOTE_PATH"]) or self.local_path != cfg["LOCAL_PATH"])
+        blocked = bool(target_changed) and self._busy
+        self.b_save.set_sensitive(dirty and bool(self.local_path) and not blocked)
         self.lbl_warn.set_visible(bool(target_changed))
-        self.lbl_warn.set_label("Al cambiar de carpeta, la próxima sincronización unirá ambos lados. No se borra nada.")
+        self.lbl_warn.set_label(core.BUSY_MSG if blocked else
+                                "Al cambiar de carpeta, la próxima sincronización unirá ambos lados. No se borra nada.")
 
     def _on_save(self, *_):
         remote, rpath = self.picked
@@ -561,7 +569,7 @@ class MainWindow(Adw.ApplicationWindow):
 
         g_f = Adw.PreferencesGroup(title="Exclusiones",
                                    description="Una regla por línea: «- patrón» excluye, «+ patrón» incluye, «#» comenta.")
-        b_fs = Gtk.Button(label="Guardar", css_classes=["flat"])
+        self.b_fs = b_fs = Gtk.Button(label="Guardar", css_classes=["flat"], tooltip_text="Guardar reglas")
         b_fs.connect("clicked", self._save_filters)
         g_f.set_header_suffix(b_fs)
         self.filters_buf = Gtk.TextBuffer()
@@ -668,8 +676,5 @@ class MainWindow(Adw.ApplicationWindow):
     def _save_filters(self, *_):
         b = self.filters_buf
         text = b.get_text(b.get_start_iter(), b.get_end_iter(), False)
-        try:
-            core.save_filters(text)
-            self.toast("Exclusiones guardadas · la próxima sincronización hará un resync")
-        except core.CoreError as e:
-            self.error(e)
+        bg(lambda: core.save_filters(text),
+           lambda _: self.toast("Exclusiones guardadas · la próxima sincronización hará un resync"), self.error)

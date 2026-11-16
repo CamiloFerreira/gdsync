@@ -119,6 +119,10 @@ ensure_filters() {
 - Thumbs.db
 - desktop.ini
 - .Trash-*/**
+# Restos de Google Drive para escritorio (Windows/macOS)
+- .sync-exclude.lst
+- .tmp.drivedownload/**
+- .tmp.driveupload/**
 EOF
 }
 
@@ -218,11 +222,25 @@ cmd_choose() {
   INTERVAL="${ans:-$INTERVAL}"
 
   validate_config
+  sync_running && die "Hay una sincronización en curso. Espera a que termine y vuelve a intentarlo."
   mkdir -p "$LOCAL_PATH"
   save_config
   info "Drive:/${REMOTE_PATH#/}  <->  $LOCAL_PATH  (cada $INTERVAL)"
   info "La próxima sincronización hará un --resync inicial."
   rm -rf "$STATE_DIR/bisync"   # fuerza resync al cambiar de carpeta
+}
+
+# ¿Hay un bisync en marcha? (unit systemd activa o lock de rclone con PID vivo)
+sync_running() {
+  local st lck pid
+  st="$(systemctl --user show "$APP.service" -p ActiveState --value 2>/dev/null || true)"
+  [[ "$st" == activating || "$st" == deactivating ]] && return 0
+  for lck in "$STATE_DIR"/bisync/*.lck; do
+    [[ -f "$lck" ]] || continue
+    pid="$(grep -o '"PID": *"[0-9]*"' "$lck" | grep -o '[0-9][0-9]*')" || continue
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && return 0
+  done
+  return 1
 }
 
 bisync() {
