@@ -111,6 +111,11 @@ class TestConfig(unittest.TestCase):
             with self.subTest(args=args), self.assertRaises(core.CoreError):
                 core.save_config(*args)
 
+    def test_save_config_root(self):
+        core.save_config("gdrive", core.ROOT, str(HOME / "GoogleDrive"), "5min")
+        self.assertEqual(core.read_config()["REMOTE_PATH"], "/")
+        self.assertTrue(core.is_configured())
+
     def test_desktop_exec_quote(self):
         self.assertEqual(core.desktop_exec_quote("/usr/bin/gdsync-desktop"), "/usr/bin/gdsync-desktop")
         self.assertEqual(core.desktop_exec_quote('/x/a b$"%'), '"/x/a b\\$\\"%%"')
@@ -166,6 +171,17 @@ class TestCLI(unittest.TestCase):
         self.assertNotIn("ExecStartPre", service + timer)
         self.assertIn("OnUnitInactiveSec=5min", timer)
         self.assertIn("(X %%h $$USER)", service)  # especificadores systemd escapados
+
+    def test_enable_accepts_root(self):
+        core.write_config({"REMOTE_NAME": "gdrive", "REMOTE_PATH": "/", "LOCAL_PATH": str(HOME / "D"), "INTERVAL": "5min"})
+        r = cli("enable")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_validate_rejects_absolute_subpath(self):
+        core.write_config({"REMOTE_NAME": "gdrive", "REMOTE_PATH": "/X", "LOCAL_PATH": str(HOME / "D"), "INTERVAL": "5min"})
+        r = cli("enable")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("Carpeta de Drive inválida", r.stderr)
 
     def test_sd_escape(self):
         src = f"source <(sed -n '/^sd_escape()/p' {GDSYNC}); sd_escape \"$1\""

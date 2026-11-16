@@ -233,7 +233,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.hero_icon.set_from_icon_name(icon)
         self.hero_icon_box.set_css_classes(["hero-icon", cls] + (["syncing"] if state == "syncing" else []))
         self.hero_title.set_label(title)
-        self.chip_remote.set_label(f"{c['REMOTE_NAME']}:{c['REMOTE_PATH']}")
+        self.chip_remote.set_label(f"{c['REMOTE_NAME']}:{core.remote_label(c['REMOTE_PATH'])}")
         self.chip_local.set_label(c["LOCAL_PATH"].replace(str(core.HOME), "~", 1))
         self.b_sync.set_sensitive(not job_running)
         self.b_dry.set_sensitive(not job_running)
@@ -363,7 +363,7 @@ class MainWindow(Adw.ApplicationWindow):
         crumbs = "Mi unidad" + "".join(f"  ›  {p}" for p in path.split("/") if p)
         self.g_browse.set_description(GLib.markup_escape_text(crumbs))
         self.b_up.set_sensitive(bool(path))
-        self.b_pick.set_sensitive(bool(path))
+        self.b_pick.set_label("Usar esta carpeta" if path else "Usar todo mi Drive")
         self.browse_spinner.start()
 
         def done(res):
@@ -389,14 +389,28 @@ class MainWindow(Adw.ApplicationWindow):
         bg(lambda: core.list_dirs(remote, path), done, fail)
 
     def _on_pick(self, *_):
-        self.picked = (self.browse_remote, self.browse_path)
+        if self.browse_path:
+            self._pick(self.browse_path)
+            return
+        dlg = Adw.AlertDialog(heading="¿Sincronizar todo tu Drive?",
+                              body="Se sincronizará toda «Mi unidad» con la carpeta local. "
+                                   "Puede ocupar mucho espacio y tardar en la primera sincronización.")
+        dlg.add_response("cancel", "Cancelar")
+        dlg.add_response("ok", "Usar todo mi Drive")
+        dlg.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
+        dlg.connect("response", lambda _d, r: r == "ok" and self._pick(core.ROOT))
+        dlg.present(self)
+
+    def _pick(self, rpath: str):
+        self.picked = (self.browse_remote, rpath)
         cfg = core.read_config()
-        if not self.local_path or (self.local_path == cfg["LOCAL_PATH"] and self.browse_path != cfg["REMOTE_PATH"]):
-            self.local_path = str(core.HOME / "GoogleDrive" / self.browse_path.split("/")[-1])
+        if not self.local_path or (self.local_path == cfg["LOCAL_PATH"] and rpath != cfg["REMOTE_PATH"]):
+            sub = "" if rpath == core.ROOT else rpath.split("/")[-1]
+            self.local_path = str(core.HOME / "GoogleDrive" / sub)
         self._refresh_picked()
 
     def _refresh_picked(self):
-        self.row_picked.set_subtitle(GLib.markup_escape_text(f"{self.picked[0]}:{self.picked[1]}") if self.picked else "Ninguna — navega y pulsa «Usar esta carpeta»")
+        self.row_picked.set_subtitle(GLib.markup_escape_text(f"{self.picked[0]}:{core.remote_label(self.picked[1])}") if self.picked else "Ninguna — navega y pulsa «Usar esta carpeta»")
         self.row_local.set_subtitle(GLib.markup_escape_text(self.local_path or "—"))
         self._check_dirty()
 

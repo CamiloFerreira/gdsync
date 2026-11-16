@@ -28,7 +28,7 @@ En GNOME, el icono de la bandeja necesita la extensión *AppIndicator*. Ubuntu l
 
 1. Abre **Google Drive Sync**. Si rclone no está instalado, la app lo instala en `~/.local/bin` sin pedir sudo.
 2. Ve a **Ajustes → Cuentas → +** para conectar tu cuenta de Google (se abre el navegador).
-3. En **Carpeta**, navega por tu Drive, pulsa *Usar esta carpeta*, elige la carpeta local y la frecuencia, y luego **Guardar**.
+3. En **Carpeta**, navega por tu Drive, pulsa *Usar esta carpeta* (o *Usar todo mi Drive* en la raíz para sincronizar «Mi unidad» completa), elige la carpeta local y la frecuencia, y luego **Guardar**.
 4. Listo: queda activada la sincronización automática y la app arranca con la sesión.
 
 | Pestaña | Contenido |

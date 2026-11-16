@@ -138,7 +138,7 @@ class App(Adw.Application):
         if not st.configured:
             return STATE_TEXT[state]
         last = f"\nÚltima: {core.fmt_rel(st.last_sync)}" if st.last_sync else ""
-        return f"{STATE_TEXT[state]}\n{st.config['REMOTE_NAME']}:{st.config['REMOTE_PATH']}{last}"
+        return f"{STATE_TEXT[state]}\n{st.config['REMOTE_NAME']}:{core.remote_label(st.config['REMOTE_PATH'])}{last}"
 
     def load_quota(self):
         remote = (self.status.config if self.status else core.read_config())["REMOTE_NAME"]

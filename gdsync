@@ -96,7 +96,9 @@ check_local_path() {
 validate_config() {
   [[ "$REMOTE_NAME" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || die "Nombre de cuenta inválido: $REMOTE_NAME"
   [[ "$INTERVAL" =~ ^[0-9]{1,5}(s|min|h|d)$ ]] || die "Intervalo inválido: $INTERVAL (ej: 5min, 1h)"
-  [[ -n "$REMOTE_PATH" && "$REMOTE_PATH" != /* && "$REMOTE_PATH" != *$'\n'* ]] || die "Carpeta de Drive inválida"
+  # "/" = raíz de Mi unidad; si no, ruta relativa sin "/" inicial
+  [[ "$REMOTE_PATH" == "/" || ( -n "$REMOTE_PATH" && "$REMOTE_PATH" != /* ) ]] || die "Carpeta de Drive inválida"
+  [[ "$REMOTE_PATH" != *$'\n'* ]] || die "Carpeta de Drive inválida"
   [[ "/$REMOTE_PATH/" != */../* ]] || die "Carpeta de Drive inválida"
   check_local_path "$LOCAL_PATH"
 }
@@ -192,7 +194,12 @@ cmd_choose() {
     [[ -n "${choice:-}" ]] || die "Cancelado"
     case "$choice" in
       "[✔ Elegir esta carpeta]")
-        [[ -z "$cur" ]] && { warn "Elige una subcarpeta, no la raíz entera"; continue; }
+        if [[ -z "$cur" ]]; then
+          warn "Vas a sincronizar TODO tu Google Drive (Mi unidad)."
+          read -r -p "¿Seguro? [s/N]: " ans
+          [[ "$ans" =~ ^[sS]$ ]] || continue
+          ans=""
+        fi
         break ;;
       "[.. Subir]")
         [[ "$cur" == */* ]] && cur="${cur%/*}" || cur="" ;;
@@ -201,8 +208,8 @@ cmd_choose() {
     esac
   done
 
-  REMOTE_PATH="$cur"
-  local default_local="$HOME/GoogleDrive/${cur##*/}"
+  REMOTE_PATH="${cur:-/}"
+  local default_local="$HOME/GoogleDrive${cur:+/${cur##*/}}"
   read -r -p "Carpeta local [$default_local]: " LOCAL_PATH
   LOCAL_PATH="${LOCAL_PATH:-$default_local}"
   LOCAL_PATH="${LOCAL_PATH/#\~/$HOME}"
@@ -213,7 +220,7 @@ cmd_choose() {
   validate_config
   mkdir -p "$LOCAL_PATH"
   save_config
-  info "Drive:/$REMOTE_PATH  <->  $LOCAL_PATH  (cada $INTERVAL)"
+  info "Drive:/${REMOTE_PATH#/}  <->  $LOCAL_PATH  (cada $INTERVAL)"
   info "La próxima sincronización hará un --resync inicial."
   rm -rf "$STATE_DIR/bisync"   # fuerza resync al cambiar de carpeta
 }
@@ -228,7 +235,7 @@ bisync() {
   if [[ -f "$LOG_FILE" ]] && (( $(stat -c %s "$LOG_FILE") > 5242880 )); then
     mv -f "$LOG_FILE" "$LOG_FILE.1"
   fi
-  rclone bisync "$REMOTE_NAME:$REMOTE_PATH" "$LOCAL_PATH" \
+  rclone bisync "$REMOTE_NAME:${REMOTE_PATH#/}" "$LOCAL_PATH" \
     --workdir "$STATE_DIR/bisync" \
     --filters-file "$FILTERS_FILE" \
     --create-empty-src-dirs \

@@ -97,6 +97,13 @@ def write_config(cfg: dict) -> None:
     _write_private(CONFIG_FILE, "".join(f"{k}={shlex.quote(str(cfg.get(k, '')))}\n" for k in CONFIG_KEYS))
 
 
+ROOT = "/"  # REMOTE_PATH para sincronizar toda «Mi unidad»
+
+
+def remote_label(remote_path: str) -> str:
+    return "Mi unidad (todo)" if remote_path == ROOT else remote_path
+
+
 def is_configured(cfg: dict | None = None) -> bool:
     cfg = cfg or read_config()
     return bool(cfg["REMOTE_PATH"] and cfg["LOCAL_PATH"])
@@ -132,11 +139,11 @@ def check_local_path(path: str) -> str:
 
 def save_config(remote: str, remote_path: str, local_path: str, interval: str) -> str:
     old = read_config()
-    remote_path = remote_path.strip("/")
+    remote_path = ROOT if remote_path == ROOT else remote_path.strip("/")
     if not valid_remote_name(remote):
         raise CoreError("Cuenta inválida")
     if not remote_path:
-        raise CoreError("Elige una carpeta de Drive (no la raíz)")
+        raise CoreError("Elige una carpeta de Drive")
     if ".." in remote_path.split("/"):
         raise CoreError("Ruta remota inválida")
     if "\n" in remote_path:
