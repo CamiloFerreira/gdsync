@@ -230,6 +230,16 @@ class MainWindow(Adw.ApplicationWindow):
         g1 = Adw.PreferencesGroup(title="Sincronización")
         self.row_auto = Adw.SwitchRow(title="Sincronización automática")
         self._auto_handler = self.row_auto.connect("notify::active", self._on_auto_toggled)
+        self.b_resume = Gtk.Button(label="Reanudar", valign=Gtk.Align.CENTER, visible=False)
+        self.b_resume.connect("clicked", lambda *_: self.app.resume_sync())
+        self.b_pause = Gtk.MenuButton(icon_name="media-playback-pause-symbolic", valign=Gtk.Align.CENTER,
+                                      css_classes=["flat"], tooltip_text="Pausar un rato")
+        pm = Gio.Menu()
+        pm.append("Pausar 1 hora", "app.pause-1h")
+        pm.append("Pausar hasta mañana", "app.pause-tomorrow")
+        self.b_pause.set_menu_model(pm)
+        self.row_auto.add_suffix(self.b_resume)
+        self.row_auto.add_suffix(self.b_pause)
         self.row_next = Adw.ActionRow(title="Próxima ejecución", subtitle="—")
         self.row_last = Adw.ActionRow(title="Última sincronización", subtitle="—")
         self.row_conflicts = Adw.ActionRow(title="Archivos con conflicto", subtitle_lines=3, visible=False)
@@ -318,8 +328,15 @@ class MainWindow(Adw.ApplicationWindow):
         self.b_dry.set_sensitive(not job_running)
         self._set_auto(st.timer_enabled)
         interval = dict(INTERVALS).get(c["INTERVAL"], c["INTERVAL"]).lower()
-        self.row_auto.set_subtitle(interval.capitalize() if st.timer_enabled else "Solo cuando pulses «Sincronizar ahora»")
+        paused = st.timer_enabled and st.paused_until is not None
+        self.row_auto.set_subtitle(f"En pausa hasta las {st.paused_until:%H:%M}" if paused else
+                                   interval.capitalize() if st.timer_enabled else "Solo cuando pulses «Sincronizar ahora»")
+        self.b_resume.set_visible(paused)
+        self.b_pause.set_visible(st.timer_enabled and not paused)
+        if paused and state == "paused":
+            self.hero_title.set_label(f"En pausa hasta las {st.paused_until:%H:%M}")
         self.row_next.set_subtitle(
+            "Al reanudar" if paused else
             (f"{core.fmt_rel(st.next_run)} · {st.next_run:%H:%M}" if st.next_run else "Al iniciar sesión")
             if st.timer_enabled else "—")
         self._show_problem(st.problem if state == "error" else None)

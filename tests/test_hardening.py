@@ -285,6 +285,44 @@ class TestFilters(unittest.TestCase):
             core.folder_rule_path(str(root), str(root / "raro[1]"))
 
 
+class TestPause(unittest.TestCase):
+    def test_seconds_until_tomorrow(self):
+        from datetime import datetime
+        self.assertEqual(core.seconds_until_tomorrow(8, datetime(2026, 11, 15, 23, 0)), 9 * 3600)
+        self.assertEqual(core.seconds_until_tomorrow(8, datetime(2026, 11, 16, 7, 0)), 3600)
+        self.assertEqual(core.seconds_until_tomorrow(8, datetime(2026, 12, 31, 9, 0)), 23 * 3600)
+
+    def test_status_reports_pause(self):
+        props = {
+            "gdsync.timer": {"UnitFileState": "enabled", "ActiveState": "inactive"},
+            "gdsync.service": {"ActiveState": "inactive", "Result": "success"},
+            "gdsync-resume.timer": {"ActiveState": "active", "NextElapseUSecRealtime": "Mon 2026-11-16 08:00:00 -03"},
+        }
+        orig = core.systemd_props
+        core.systemd_props = lambda unit, _p: props.get(unit, {})
+        try:
+            core.write_config({"REMOTE_NAME": "gdrive", "REMOTE_PATH": "X", "LOCAL_PATH": str(HOME / "D"), "INTERVAL": "5min"})
+            st = core.get_status()
+        finally:
+            core.systemd_props = orig
+        self.assertEqual(st.paused_until.strftime("%H:%M"), "08:00")
+        self.assertIsNone(st.next_run)
+
+    def test_disable_cancels_pending_resume(self):
+        logdir = TMP / "sclog"
+        logdir.mkdir(exist_ok=True)
+        log = logdir / "calls"
+        fake = logdir / "systemctl"
+        fake.write_text(f'#!/bin/sh\necho "$@" >> {log}\nexit 0\n')
+        fake.chmod(0o755)
+        r = cli("disable", PATH=f"{logdir}:{os.environ['PATH']}")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = log.read_text().splitlines()
+        self.assertIn("--user stop gdsync-resume.timer", calls)
+        self.assertLess(calls.index("--user stop gdsync-resume.timer"),
+                        calls.index("--user disable --now gdsync.timer"))
+
+
 class TestCLI(unittest.TestCase):
     def setUp(self):
         for unit in ("gdsync.service", "gdsync.timer"):

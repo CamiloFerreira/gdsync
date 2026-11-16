@@ -387,6 +387,8 @@ EOF
 }
 
 cmd_disable() {
+  # Cancela también una pausa temporal: si no, su timer volvería a arrancar el sync
+  systemctl --user stop "$APP-resume.timer" 2>/dev/null || true
   systemctl --user disable --now "$APP.timer" 2>/dev/null || true
   info "Timer desactivado"
 }

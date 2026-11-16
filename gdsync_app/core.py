@@ -10,7 +10,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
@@ -382,6 +382,42 @@ def set_timer(enabled: bool) -> None:
         raise CoreError(last_err(r, "Error con systemd"))
 
 
+RESUME_UNIT = f"{APP}-resume"
+
+
+def pause_for(seconds: int) -> None:
+    """Pausa el timer (sin deshabilitarlo) y programa su reanudación con un timer transitorio.
+    Si se reinicia el equipo, el timer habilitado vuelve solo: la pausa nunca queda olvidada."""
+    if not timer_enabled():
+        raise CoreError("La sincronización automática no está activada")
+    until = datetime.now() + timedelta(seconds=max(60, int(seconds)))
+    run(["systemctl", "--user", "stop", f"{RESUME_UNIT}.timer"], timeout=15)
+    # on-calendar (hora absoluta): así systemd informa la hora real de reanudación
+    r = run(["systemd-run", "--user", f"--unit={RESUME_UNIT}", f"--on-calendar={until:%Y-%m-%d %H:%M:%S}",
+             "--timer-property=AccuracySec=30s", "--description=Reanuda gdsync tras una pausa",
+             "systemctl", "--user", "start", f"{APP}.timer"], timeout=15)
+    if r.returncode != 0:
+        raise CoreError(last_err(r, "No se pudo programar la reanudación"))
+    r = run(["systemctl", "--user", "stop", f"{APP}.timer"], timeout=15)
+    if r.returncode != 0:
+        raise CoreError(last_err(r, "No se pudo pausar"))
+
+
+def resume() -> None:
+    run(["systemctl", "--user", "stop", f"{RESUME_UNIT}.timer"], timeout=15)
+    r = run(["systemctl", "--user", "start", f"{APP}.timer"], timeout=15)
+    if r.returncode != 0:
+        raise CoreError(last_err(r, "No se pudo reanudar"))
+
+
+def seconds_until_tomorrow(hour: int = 8, now: datetime | None = None) -> int:
+    now = now or datetime.now()
+    target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return int((target - now).total_seconds())
+
+
 def stop_service() -> None:
     r = run(["systemctl", "--user", "stop", f"{APP}.service"], timeout=30)
     if r.returncode != 0:
@@ -439,6 +475,7 @@ class Status:
     initialized: bool = False
     last_sync: datetime | None = None
     last_ok: bool | None = None
+    paused_until: datetime | None = None
     problem: "Diagnosis | None" = None
     shared_client_id: bool = False
 
@@ -451,7 +488,7 @@ class Status:
             return "syncing"
         if self.service_failed or self.last_ok is False:
             return "error"
-        if not self.timer_enabled or not self.initialized:
+        if not self.timer_enabled or not self.initialized or self.paused_until:
             return "paused"
         return "ok"
 
@@ -551,7 +588,7 @@ def tail(path: Path, n: int) -> list[str]:
 
 def get_status() -> Status:
     cfg = read_config()
-    t = systemd_props(f"{APP}.timer", ["UnitFileState", "NextElapseUSecRealtime"])
+    t = systemd_props(f"{APP}.timer", ["UnitFileState", "NextElapseUSecRealtime", "ActiveState"])
     s = systemd_props(f"{APP}.service", ["ActiveState", "Result"])
     st = Status(
         rclone=rclone_version(), config=cfg, configured=is_configured(cfg),
@@ -561,6 +598,11 @@ def get_status() -> Status:
         service_failed=s.get("Result") not in (None, "", "success"),
         initialized=bisync_initialized(),
     )
+    if st.timer_enabled and t.get("ActiveState") == "inactive":
+        rt = systemd_props(f"{RESUME_UNIT}.timer", ["ActiveState", "NextElapseUSecRealtime"])
+        if rt.get("ActiveState") == "active":
+            st.paused_until = parse_systemd_time(rt.get("NextElapseUSecRealtime"))
+            st.next_run = None
     lines = tail(LOG_FILE, 400)
     for line in reversed(lines):
         ok = any(k in line for k in RESULT_OK)

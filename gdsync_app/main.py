@@ -56,7 +56,9 @@ class App(Adw.Application):
         for name, cb in (("quit", lambda *_: self.quit_app()), ("open-folder", lambda *_: self.open_folder()),
                          ("about", lambda *_: self.about()), ("show", lambda *_: self.show_window()),
                          ("sync", lambda *_: self.start_job("sync")),
-                         ("check-updates", lambda *_: self.check_updates_now())):
+                         ("check-updates", lambda *_: self.check_updates_now()),
+                         ("pause-1h", lambda *_: self.pause_sync(3600)),
+                         ("pause-tomorrow", lambda *_: self.pause_sync(core.seconds_until_tomorrow()))):
             a = Gio.SimpleAction.new(name, None)
             a.connect("activate", cb)
             self.add_action(a)
@@ -180,6 +182,13 @@ class App(Adw.Application):
             MenuItem("Abrir carpeta local", self.open_folder, enabled=configured),
             MenuItem("Sincronización automática", self._tray_toggle_timer, enabled=configured,
                      toggle=bool(st and st.timer_enabled)),
+        ]
+        if st and st.timer_enabled and st.paused_until:
+            items.append(MenuItem(f"Reanudar (en pausa hasta las {st.paused_until:%H:%M})", self.resume_sync))
+        elif st and st.timer_enabled:
+            items += [MenuItem("Pausar 1 hora", lambda: self.pause_sync(3600)),
+                      MenuItem("Pausar hasta mañana", lambda: self.pause_sync(core.seconds_until_tomorrow()))]
+        items += [
             MenuItem(separator=True),
             MenuItem("Salir", self.quit_app),
         ]
@@ -187,6 +196,16 @@ class App(Adw.Application):
         if sig != getattr(self, "_menu_sig", None):
             self._menu_sig = sig
             self.tray.set_menu(items)
+
+    def pause_sync(self, seconds: int):
+        def done(_):
+            self.refresh()
+            msg = "Sincronización en pausa"
+            self.win.toast(msg) if self.win.get_visible() else self.notify(msg, "Se reanudará sola.")
+        bg(lambda: core.pause_for(seconds), done, lambda e: self.notify("No se pudo pausar", str(e)))
+
+    def resume_sync(self):
+        bg(core.resume, lambda _: self.refresh(), lambda e: self.notify("No se pudo reanudar", str(e)))
 
     def _tray_toggle_timer(self):
         want = not (self.status and self.status.timer_enabled)
