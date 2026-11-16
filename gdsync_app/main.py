@@ -25,7 +25,8 @@ TRAY_ICON = {"ok": "gdsync-tray-ok-symbolic", "syncing": "gdsync-tray-sync-symbo
 STATE_TEXT = {"ok": "Todo sincronizado", "syncing": "Sincronizando…", "error": "Error de sincronización",
               "paused": "Sincronización en pausa", "setup": "Sin configurar"}
 JOB_TITLES = {"sync": "Sincronizando…", "dry-run": "Simulando (no se cambia nada)…", "resync": "Resync completo…",
-              "install-rclone": "Instalando rclone…", "add-remote": "Conectando cuenta (mira tu navegador)…"}
+              "install-rclone": "Instalando rclone…", "add-remote": "Conectando cuenta (mira tu navegador)…",
+              "reauth": "Reconectando cuenta (mira tu navegador)…"}
 
 
 class App(Adw.Application):
@@ -126,7 +127,9 @@ class App(Adw.Application):
         state = "syncing" if job_sync or st.service_running else st.state
         # Notificar errores del sync automático (transición a error)
         if self.prev_state == "syncing" and state == "error" and not job_sync:
-            self.notify("Error de sincronización", "Revisa la pestaña Actividad.", urgent=True)
+            p = st.problem
+            self.notify(p.title if p else "Error de sincronización",
+                        p.detail if p else "Revisa la pestaña Actividad.", urgent=True)
         self.prev_state = state
         self.win.update_status(st, job_sync or st.service_running)
         self.tray.set_icon(TRAY_ICON["error" if self.blocked else state], self._tooltip(st, state))
@@ -196,7 +199,7 @@ class App(Adw.Application):
             return
         self.win.append_lines([f"▶ {JOB_TITLES.get(kind, kind)}"], scroll=True)
         self.win.set_job(JOB_TITLES.get(kind, kind))
-        if kind in ("dry-run", "add-remote", "install-rclone"):
+        if kind in ("dry-run", "add-remote", "install-rclone", "reauth"):
             self.win.stack.set_visible_child_name("activity")
         # sync/resync: rclone escribe en sync.log, que ya seguimos; evitamos duplicar.
         quiet = kind in ("sync", "resync")
@@ -218,7 +221,7 @@ class App(Adw.Application):
         self.win.toast(msg)
         if not self.win.is_active() and not job.cancelled:
             self.notify(msg, "Abre gdsync para ver los detalles." if not ok else "", urgent=not ok)
-        if job.kind == "add-remote":
+        if job.kind in ("add-remote", "reauth"):
             self.win.load_settings()
             self.win.load_folder_page()
         if job.kind in ("sync", "resync", "install-rclone"):

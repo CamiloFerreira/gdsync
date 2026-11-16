@@ -111,6 +111,20 @@ class TestConfig(unittest.TestCase):
             with self.subTest(args=args), self.assertRaises(core.CoreError):
                 core.save_config(*args)
 
+    def test_save_config_rejects_readonly_folder(self):
+        ro = HOME / "SoloLectura"
+        ro.mkdir(exist_ok=True)
+        ro.chmod(0o500)
+        try:
+            with self.assertRaises(core.CoreError) as cm:
+                core.save_config("gdrive", "X", str(ro), "5min")
+            self.assertIn("permiso de escritura", str(cm.exception))
+        finally:
+            ro.chmod(0o700)
+
+    def test_free_space_walks_up_to_existing_parent(self):
+        self.assertIsNotNone(core.free_space(str(HOME / "no/existe/aun")))
+
     def test_save_config_root(self):
         core.save_config("gdrive", core.ROOT, str(HOME / "GoogleDrive"), "5min")
         self.assertEqual(core.read_config()["REMOTE_PATH"], "/")
@@ -164,6 +178,43 @@ class TestBusyGuard(unittest.TestCase):
         self.assertEqual(subprocess.run(["bash", "-c", src]).returncode, 0)
         self.lock(999999999)
         self.assertNotEqual(subprocess.run(["bash", "-c", src]).returncode, 0)
+
+
+class TestDiagnose(unittest.TestCase):
+    LOG = [
+        "2026/11/15 10:00:00 INFO  : Bisync successful",
+        "2026/11/15 10:05:00 INFO  : Synching Path1",
+        "2026/11/15 10:05:01 ERROR : a.txt: open /m/a.txt: permission denied",
+        "2026/11/15 10:05:02 ERROR : Bisync aborted. Error is retryable without --resync due to --resilient mode.",
+    ]
+
+    def test_last_run_only(self):
+        self.assertEqual(core.last_run_lines(self.LOG), self.LOG[1:])
+        self.assertEqual(core.last_run_lines(self.LOG[:1]), self.LOG[:1])
+        self.assertEqual(core.last_run_lines(["x"]), [])
+
+    def test_cases(self):
+        cases = {
+            "permission denied": ("open-folder", self.LOG),
+            "reauth": ("reauth", ["ERROR : couldn't fetch token: invalid_grant", "Bisync aborted"]),
+            "resync": ("resync", ["ERROR : Bisync critical error: cannot find prior Path1 or Path2 listings"]),
+            "deletes": ("resync", ["ERROR : Safety abort: too many deletes (>50%, 10 of 12)", "Bisync aborted"]),
+            "quota": ("url", ["ERROR : googleapi: Error 403: Quota exceeded for quota metric", "Bisync aborted"]),
+            "net": (None, ["ERROR : dial tcp: lookup www.googleapis.com: no such host", "Bisync aborted"]),
+            "disk": ("open-folder", ["2026/11/15 10:00:00 gdsync ERROR: El disco de /mnt/x no está conectado"]),
+        }
+        for name, (action, lines) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(core.diagnose(lines).action, action)
+
+    def test_gdsync_error_counts_as_failed_run(self):
+        core.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        core.LOG_FILE.write_text("2026/11/15 10:00:00 INFO  : Bisync successful\n"
+                                 "2026/11/15 11:00:00 gdsync ERROR: algo\n")
+        try:
+            self.assertIs(core.get_status().last_ok, False)
+        finally:
+            core.LOG_FILE.unlink()
 
 
 class TestCLI(unittest.TestCase):
@@ -227,6 +278,16 @@ class TestCLI(unittest.TestCase):
         r = cli("enable")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("Carpeta de Drive inválida", r.stderr)
+
+    def test_unmounted_disk_is_refused_and_logged(self):
+        local = "/mnt/gdsync-test-no-existe/Drive"
+        core.write_config({"REMOTE_NAME": "gdrive", "REMOTE_PATH": "X", "LOCAL_PATH": local, "INTERVAL": "5min"})
+        r = cli("sync")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("no está conectado", r.stderr)
+        self.assertFalse(Path(local).exists())
+        self.assertIn("gdsync ERROR: El disco", core.LOG_FILE.read_text())
+        core.LOG_FILE.unlink()
 
     def test_sd_escape(self):
         src = f"source <(sed -n '/^sd_escape()/p' {GDSYNC}); sd_escape \"$1\""

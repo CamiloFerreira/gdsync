@@ -141,6 +141,17 @@ def check_local_path(path: str) -> str:
     return path
 
 
+def free_space(path: str) -> int | None:
+    """Bytes libres en el disco donde quedaría `path` (sube hasta un ancestro existente)."""
+    p = Path(os.path.expanduser(path or "")).absolute()
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    try:
+        return shutil.disk_usage(p).free
+    except OSError:
+        return None
+
+
 def save_config(remote: str, remote_path: str, local_path: str, interval: str) -> str:
     old = read_config()
     remote_path = ROOT if remote_path == ROOT else remote_path.strip("/")
@@ -159,7 +170,12 @@ def save_config(remote: str, remote_path: str, local_path: str, interval: str) -
     target_changed = any(old[k] != cfg[k] for k in ("REMOTE_NAME", "REMOTE_PATH", "LOCAL_PATH"))
     if target_changed and sync_in_progress():
         raise CoreError(BUSY_MSG)
-    Path(lp).mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        Path(lp).mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as e:
+        raise CoreError(f"No se pudo crear la carpeta local: {e.strerror}") from e
+    if not os.access(lp, os.W_OK | os.X_OK):
+        raise CoreError(f"No tienes permiso de escritura en {lp}. Cambia sus permisos o elige otra carpeta.")
     write_config(cfg)
 
     msgs = ["Configuración guardada"]
@@ -359,6 +375,8 @@ class Status:
     initialized: bool = False
     last_sync: datetime | None = None
     last_ok: bool | None = None
+    problem: "Diagnosis | None" = None
+    shared_client_id: bool = False
 
     @property
     def state(self) -> str:
@@ -375,6 +393,85 @@ class Status:
 
 
 LOG_TS = re.compile(r"^(\d{4}/\d\d/\d\d \d\d:\d\d:\d\d)")
+# Línea que cierra una ejecución (las escribe rclone, o gdsync al abortar antes de rclone)
+RESULT_OK = ("Bisync successful",)
+RESULT_BAD = ("Bisync aborted", "Bisync critical error", "gdsync ERROR:")
+DRIVE_CLIENT_ID_URL = "https://rclone.org/drive/#making-your-own-client-id"
+
+
+def _is_result(line: str) -> bool:
+    return any(k in line for k in RESULT_OK + RESULT_BAD)
+
+
+def last_run_lines(lines: list[str]) -> list[str]:
+    """Líneas de la última ejecución terminada (entre el resultado anterior y el último)."""
+    idx = [i for i, l in enumerate(lines) if _is_result(l)]
+    if not idx:
+        return []
+    end = idx[-1]
+    start = idx[-2] + 1 if len(idx) > 1 else 0
+    return lines[start:end + 1]
+
+
+@dataclass
+class Diagnosis:
+    title: str
+    detail: str
+    action: str | None = None   # resync | reauth | open-folder | url | None
+    action_label: str = ""
+    url: str = ""
+
+
+def diagnose(lines: list[str]) -> Diagnosis:
+    """Traduce los errores de una ejecución a algo entendible y una acción sugerida."""
+    text = "\n".join(lines)
+    low = text.lower()
+    m = re.search(r"gdsync ERROR: (.+)", text)
+    if m and "disco" in m.group(1).lower():
+        return Diagnosis("El disco no está conectado", m.group(1).strip(), "open-folder", "Abrir carpeta")
+    if any(k in low for k in ("invalid_grant", "token expired", "couldn't fetch token", "empty token",
+                              "oauth2: cannot fetch token", "error 401")):
+        return Diagnosis("Hay que volver a conectar tu cuenta",
+                         "Google rechazó el acceso (la autorización venció o se revocó).",
+                         "reauth", "Reconectar cuenta")
+    if "permission denied" in low:
+        p = re.search(r"open ([^:]+): permission denied|([^ ]+): permission denied", text)
+        where = (p.group(1) or p.group(2)) if p else ""
+        return Diagnosis("Sin permiso para escribir en la carpeta local",
+                         (f"No se puede escribir en {where}. " if where else "")
+                         + "Revisa los permisos de la carpeta (o si el disco está montado en solo lectura).",
+                         "open-folder", "Abrir carpeta")
+    if "no space left on device" in low:
+        return Diagnosis("El disco está lleno", "No queda espacio en la carpeta local.", "open-folder", "Abrir carpeta")
+    if "too many deletes" in low or "safety abort" in low:
+        return Diagnosis("Se detuvo por seguridad: demasiados borrados",
+                         "Desapareció una gran parte de los archivos de un lado. Si el disco se desconectó, "
+                         "conéctalo y vuelve a sincronizar. «Forzar resync» une ambos lados y restaura lo que falte.",
+                         "resync", "Forzar resync")
+    if any(k in low for k in ("must run --resync", "cannot find prior path1 or path2 listings",
+                              "out of sync", "resync is required", "bisync critical error")):
+        return Diagnosis("La sincronización necesita repararse",
+                         "El historial de bisync quedó inconsistente. Repararlo une ambos lados desde cero; no borra archivos.",
+                         "resync", "Reparar")
+    if any(k in low for k in ("quota exceeded", "ratelimitexceeded", "userratelimitexceeded", "error 429")):
+        return Diagnosis("Google limitó las peticiones",
+                         "Se volverá a intentar en la próxima sincronización. Si pasa seguido, crea tu propio "
+                         "client_id de Google Drive (el compartido de rclone tiene límites y se está retirando).",
+                         "url", "Cómo hacerlo", DRIVE_CLIENT_ID_URL)
+    if any(k in low for k in ("no such host", "dial tcp", "network is unreachable", "i/o timeout",
+                              "connection refused", "connection reset", "tls handshake timeout")):
+        return Diagnosis("Sin conexión con Google Drive",
+                         "Revisa tu conexión a internet. Se volverá a intentar automáticamente.")
+    if m:
+        return Diagnosis("La sincronización no pudo empezar", m.group(1).strip())
+    errs = [l for l in lines if "ERROR" in l]
+    last = errs[-1] if errs else (lines[-1] if lines else "")
+    last = re.sub(r"^\S+ \S+ (ERROR|NOTICE|INFO)\s*:\s*", "", last).strip()
+    return Diagnosis("Hubo un problema al sincronizar", last[:300] or "Revisa la pestaña Actividad.")
+
+
+def uses_shared_client_id(lines: list[str]) -> bool:
+    return any("shared Google Drive client_id" in l for l in lines)
 
 
 def tail(path: Path, n: int) -> list[str]:
@@ -400,15 +497,22 @@ def get_status() -> Status:
         service_failed=s.get("Result") not in (None, "", "success"),
         initialized=bisync_initialized(),
     )
-    for line in reversed(tail(LOG_FILE, 400)):
-        ok = "Bisync successful" in line
-        bad = "Bisync aborted" in line or "Bisync critical error" in line
+    lines = tail(LOG_FILE, 400)
+    for line in reversed(lines):
+        ok = any(k in line for k in RESULT_OK)
+        bad = any(k in line for k in RESULT_BAD)
         if ok or bad:
             st.last_ok = ok
             m = LOG_TS.match(line)
             if m:
                 st.last_sync = datetime.strptime(m.group(1), "%Y/%m/%d %H:%M:%S")
             break
+    run_lines = last_run_lines(lines)
+    if st.last_ok is False:
+        st.problem = diagnose(run_lines)
+    elif st.service_failed:
+        st.problem = Diagnosis("La última sincronización falló", "Revisa la pestaña Actividad para ver el detalle.")
+    st.shared_client_id = uses_shared_client_id(run_lines or lines[-200:])
     return st
 
 
@@ -459,6 +563,10 @@ def job_command(kind: str, arg: str = "") -> list[str]:
         return [str(GDSYNC), "sync"]
     if kind in ("dry-run", "resync", "install-rclone"):
         return [str(GDSYNC), kind]
+    if kind == "reauth":
+        if not valid_remote_name(arg):
+            raise CoreError("Cuenta inválida")
+        return [rclone_bin() or "rclone", "config", "reconnect", f"{arg}:", "--auto-confirm"]
     if kind == "add-remote":
         if not valid_remote_name(arg):
             raise CoreError("Nombre inválido: usa letras, números, - o _")

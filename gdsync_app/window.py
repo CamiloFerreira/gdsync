@@ -188,6 +188,19 @@ class MainWindow(Adw.ApplicationWindow):
         g0.add(hero)
         page.add(g0)
 
+        # -- qué pasó y cómo arreglarlo (solo con error)
+        self.g_problem = Adw.PreferencesGroup(visible=False)
+        self.row_problem = Adw.ActionRow(css_classes=["error"], title_lines=2, subtitle_lines=4)
+        self.row_problem.add_prefix(Gtk.Image(icon_name="dialog-warning-symbolic"))
+        self.b_problem = Gtk.Button(valign=Gtk.Align.CENTER, css_classes=["suggested-action"])
+        self.b_problem.connect("clicked", lambda *_: self._problem_action())
+        b_details = Gtk.Button(label="Ver detalles", valign=Gtk.Align.CENTER, css_classes=["flat"])
+        b_details.connect("clicked", lambda *_: self.stack.set_visible_child_name("activity"))
+        self.row_problem.add_suffix(b_details)
+        self.row_problem.add_suffix(self.b_problem)
+        self.g_problem.add(self.row_problem)
+        page.add(self.g_problem)
+
         g1 = Adw.PreferencesGroup(title="Sincronización")
         self.row_auto = Adw.SwitchRow(title="Sincronización automática")
         self._auto_handler = self.row_auto.connect("notify::active", self._on_auto_toggled)
@@ -197,11 +210,22 @@ class MainWindow(Adw.ApplicationWindow):
             g1.add(r)
         page.add(g1)
 
+        # Aviso: el client_id compartido de rclone tiene límites y se está retirando
+        self.row_client_id = Adw.ActionRow(
+            title="Tu cuenta usa el acceso compartido de rclone",
+            subtitle="Google lo limita y rclone lo está retirando. Crea tu propio client_id para evitar errores 403 y cortes.",
+            subtitle_lines=3, visible=False)
+        self.row_client_id.add_prefix(Gtk.Image(icon_name="dialog-information-symbolic"))
+        b_cid = Gtk.Button(label="Cómo hacerlo", valign=Gtk.Align.CENTER)
+        b_cid.connect("clicked", lambda *_: Gtk.UriLauncher.new(core.DRIVE_CLIENT_ID_URL).launch(self, None, None))
+        self.row_client_id.add_suffix(b_cid)
+
         g2 = Adw.PreferencesGroup(title="Almacenamiento")
         self.row_quota = Adw.ActionRow(title="Google Drive", subtitle="Cargando…")
         self.quota_bar = Gtk.LevelBar(min_value=0, max_value=1, valign=Gtk.Align.CENTER, width_request=180)
         self.row_quota.add_suffix(self.quota_bar)
         g2.add(self.row_quota)
+        g2.add(self.row_client_id)
         page.add(g2)
         self.status_stack.add_named(page, "main")
 
@@ -268,13 +292,40 @@ class MainWindow(Adw.ApplicationWindow):
         self.row_next.set_subtitle(
             (f"{core.fmt_rel(st.next_run)} · {st.next_run:%H:%M}" if st.next_run else "Al iniciar sesión")
             if st.timer_enabled else "—")
+        self._show_problem(st.problem if state == "error" else None)
+        self.row_client_id.set_visible(st.shared_client_id)
         if st.last_sync:
             self.row_last.set_subtitle(f"{core.fmt_rel(st.last_sync)} · {st.last_sync:%d/%m %H:%M}"
                                        + ("" if st.last_ok else " · con errores, revisa Actividad"))
         else:
             self.row_last.set_subtitle("Nunca")
 
+    def _show_problem(self, d):
+        self._problem = d
+        self.g_problem.set_visible(d is not None)
+        if not d:
+            return
+        self.row_problem.set_title(GLib.markup_escape_text(d.title))
+        self.row_problem.set_subtitle(GLib.markup_escape_text(d.detail))
+        self.b_problem.set_visible(bool(d.action))
+        self.b_problem.set_label(d.action_label or "Arreglar")
+        self.hero_title.set_label(d.title)
+
+    def _problem_action(self):
+        d = getattr(self, "_problem", None)
+        if not d:
+            return
+        if d.action == "resync":
+            self._confirm_resync()
+        elif d.action == "reauth":
+            self.app.start_job("reauth", (self.status.config if self.status else core.read_config())["REMOTE_NAME"])
+        elif d.action == "open-folder":
+            self.app.open_folder()
+        elif d.action == "url" and d.url:
+            Gtk.UriLauncher.new(d.url).launch(self, None, None)
+
     def update_quota(self, remote: str, q: dict | None, err: str | None = None):
+        self._quota = (remote, q) if q and not err else None
         self.row_quota.set_title(f"Google Drive · {remote}")
         if err or not q:
             self.row_quota.set_subtitle(err or "No disponible")
@@ -437,7 +488,23 @@ class MainWindow(Adw.ApplicationWindow):
     def _refresh_picked(self):
         self.row_picked.set_subtitle(GLib.markup_escape_text(f"{self.picked[0]}:{core.remote_label(self.picked[1])}") if self.picked else "Ninguna — navega y pulsa «Usar esta carpeta»")
         self.row_local.set_subtitle(GLib.markup_escape_text(self.local_path or "—"))
+        self._space_warning = ""
         self._check_dirty()
+        if not self.local_path:
+            return
+        path, picked = self.local_path, self.picked
+
+        def done(free):
+            if path != self.local_path or free is None:
+                return
+            self.row_local.set_subtitle(GLib.markup_escape_text(f"{path} · {core.fmt_bytes(free)} libres"))
+            q = getattr(self, "_quota", None)
+            # Todo el Drive: avisar si lo que ocupa no cabe en el disco
+            if picked and picked[1] == core.ROOT and q and q[0] == picked[0] and q[1].get("used", 0) > free:
+                self._space_warning = (f"Tu Drive ocupa {core.fmt_bytes(q[1]['used'])} y en este disco quedan "
+                                       f"{core.fmt_bytes(free)} libres: puede que no quepa todo.")
+                self._check_dirty()
+        bg(lambda: core.free_space(path), done)
 
     def _on_choose_local(self, *_):
         dlg = Gtk.FileDialog(title="Carpeta local de sincronización", modal=True)
@@ -466,9 +533,12 @@ class MainWindow(Adw.ApplicationWindow):
             self.picked != (cfg["REMOTE_NAME"], cfg["REMOTE_PATH"]) or self.local_path != cfg["LOCAL_PATH"])
         blocked = bool(target_changed) and self._busy
         self.b_save.set_sensitive(dirty and bool(self.local_path) and not blocked)
-        self.lbl_warn.set_visible(bool(target_changed))
-        self.lbl_warn.set_label(core.BUSY_MSG if blocked else
-                                "Al cambiar de carpeta, la próxima sincronización unirá ambos lados. No se borra nada.")
+        msgs = [core.BUSY_MSG if blocked else
+                "Al cambiar de carpeta, la próxima sincronización unirá ambos lados. No se borra nada."] if target_changed else []
+        if getattr(self, "_space_warning", "") and dirty:
+            msgs.append(self._space_warning)
+        self.lbl_warn.set_visible(bool(msgs))
+        self.lbl_warn.set_label("\n".join(msgs))
 
     def _on_save(self, *_):
         remote, rpath = self.picked
