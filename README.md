@@ -26,17 +26,21 @@ En GNOME, el icono de la bandeja necesita la extensión *AppIndicator*. Ubuntu l
 
 ## Uso
 
-1. Abre **Google Drive Sync**. Si rclone no está instalado, la app lo instala en `~/.local/bin` sin pedir sudo.
-2. Ve a **Ajustes → Cuentas → +** para conectar tu cuenta de Google (se abre el navegador).
-3. En **Carpeta**, navega por tu Drive, pulsa *Usar esta carpeta* (o *Usar todo mi Drive* en la raíz para sincronizar «Mi unidad» completa), elige la carpeta local y la frecuencia, y luego **Guardar**.
-4. Listo: queda activada la sincronización automática y la app arranca con la sesión.
+1. Abre **Google Drive Sync**. La pantalla de bienvenida te guía en tres pasos:
+   - instalar rclone (en `~/.local/bin`, sin sudo);
+   - conectar tu cuenta de Google (se abre el navegador);
+   - elegir qué sincronizar.
+2. En **Carpeta**, navega por tu Drive, pulsa *Usar esta carpeta* (o *Usar todo mi Drive* en la raíz para sincronizar «Mi unidad» completa), elige la carpeta local y la frecuencia, y luego **Guardar**.
+3. Listo: queda activada la sincronización automática y la app arranca con la sesión.
 
 | Pestaña | Contenido |
 |---|---|
-| Estado | Estado general, Sincronizar ahora, Simular, sync automático, próxima y última ejecución, cuota de Drive |
-| Carpeta | Navegador de Drive, carpeta local y frecuencia |
-| Actividad | Log en vivo con colores, cancelar, forzar resync |
-| Ajustes | Inicio con la sesión, notificaciones, cuentas, exclusiones, versión de rclone |
+| Estado | Estado general con progreso en vivo (fase, GB, velocidad, tiempo restante), Sincronizar ahora, Detener, Simular, pausa temporal, próxima y última ejecución, cuota de Drive. Si algo falla, explica qué pasó y ofrece el arreglo (reconectar cuenta, reparar, abrir carpeta) |
+| Carpeta | Navegador de Drive, carpeta local (con espacio libre) y frecuencia |
+| Actividad | **Cambios**: archivos subidos, descargados y borrados, y conflictos. **Registro**: log en vivo de rclone. Cancelar y forzar resync |
+| Ajustes | Inicio con la sesión, notificaciones, cuentas, exclusiones (interruptores, carpetas excluidas y reglas avanzadas), actualizaciones, versión de rclone |
+
+Desde el icono de la bandeja puedes **pausar la sincronización 1 hora o hasta mañana**; se reanuda sola, aunque la app esté cerrada.
 
 Si cierras la ventana, la app sigue en la bandeja. Para cerrarla del todo usa **Salir** en el menú del icono, o `Ctrl+Q`.
 
