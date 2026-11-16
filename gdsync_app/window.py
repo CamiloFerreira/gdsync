@@ -293,8 +293,7 @@ class MainWindow(Adw.ApplicationWindow):
         if job_running != self._busy:
             self._busy = job_running
             self._check_dirty()
-            self.b_fs.set_sensitive(not job_running)
-            self.b_fs.set_tooltip_text(core.BUSY_MSG if job_running else "Guardar reglas")
+            self._filters_check()
         c = st.config
         if not st.rclone or not st.configured:
             self.status_stack.set_visible_child_name("setup")
@@ -732,17 +731,39 @@ class MainWindow(Adw.ApplicationWindow):
         page.add(self.g_accounts)
 
         g_f = Adw.PreferencesGroup(title="Exclusiones",
-                                   description="Una regla por línea: «- patrón» excluye, «+ patrón» incluye, «#» comenta.")
-        self.b_fs = b_fs = Gtk.Button(label="Guardar", css_classes=["flat"], tooltip_text="Guardar reglas")
-        b_fs.connect("clicked", self._save_filters)
+                                   description="Lo excluido no se sube ni se descarga. Lo que ya esté en Drive no se borra.")
+        self.b_fs = b_fs = Gtk.Button(label="Guardar", css_classes=["suggested-action"], sensitive=False,
+                                      valign=Gtk.Align.CENTER, tooltip_text="Guardar exclusiones")
+        b_fs.connect("clicked", self._confirm_save_filters)
         g_f.set_header_suffix(b_fs)
+        self.f_presets: set[str] = set()
+        self.f_folders: list[str] = []
+        self.preset_rows: dict[str, Adw.SwitchRow] = {}
+        for key, (title, sub, _rules) in core.FILTER_PRESETS.items():
+            row = Adw.SwitchRow(title=title, subtitle=GLib.markup_escape_text(sub))
+            row.connect("notify::active", lambda r, _p, k=key: self._on_preset(k, r.get_active()))
+            self.preset_rows[key] = row
+            g_f.add(row)
+        page.add(g_f)
+
+        self.g_ffolders = Adw.PreferencesGroup(title="Carpetas excluidas",
+                                               description="Carpetas de tu carpeta sincronizada que no se sincronizan.")
+        b_addf = Gtk.Button(icon_name="list-add-symbolic", tooltip_text="Excluir una carpeta…", css_classes=["flat"])
+        b_addf.connect("clicked", self._add_excluded_folder)
+        self.g_ffolders.set_header_suffix(b_addf)
+        self.ffolder_rows: list[Gtk.Widget] = []
+        page.add(self.g_ffolders)
+
+        g_fadv = Adw.PreferencesGroup()
+        exp = Adw.ExpanderRow(title="Reglas avanzadas",
+                              subtitle="Una por línea: «- patrón» excluye, «+ patrón» incluye (sintaxis de rclone)")
         self.filters_buf = Gtk.TextBuffer()
+        self.filters_buf.connect("changed", lambda *_: self._filters_check())
         tv = Gtk.TextView(buffer=self.filters_buf, monospace=True, top_margin=10, bottom_margin=10,
                           left_margin=12, right_margin=12, css_classes=["filters"])
-        frame = Gtk.Frame(child=Gtk.ScrolledWindow(child=tv, min_content_height=180, max_content_height=320, propagate_natural_height=True),
-                          css_classes=["card"])
-        g_f.add(frame)
-        page.add(g_f)
+        exp.add_row(Gtk.ScrolledWindow(child=tv, min_content_height=120, max_content_height=320, propagate_natural_height=True))
+        g_fadv.add(exp)
+        page.add(g_fadv)
 
         g_upd = Adw.PreferencesGroup(title="Actualizaciones")
         self.row_app_update = Adw.ActionRow(title="gdsync", subtitle="—")
@@ -778,7 +799,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.row_autostart.set_active(core.autostart_enabled())
         self.row_autostart.handler_unblock(self._as_handler)
         self.row_notify.set_active(self.app.settings_get("notify", True))
-        self.filters_buf.set_text(core.read_filters() or core.DEFAULT_FILTERS)
+        self._load_filters()
         self.row_rclone.set_subtitle((self.status.rclone if self.status and self.status.rclone else "No instalado"))
         self._load_accounts()
 
@@ -837,8 +858,106 @@ class MainWindow(Adw.ApplicationWindow):
         dlg.connect("response", resp)
         dlg.present(self)
 
-    def _save_filters(self, *_):
+    # ---------------------------------------------------------- exclusiones
+    def _load_filters(self):
+        self._saved_filters = core.read_filters() or core.DEFAULT_FILTERS
+        presets, folders, custom = core.parse_filters(self._saved_filters)
+        self._loading_filters = True
+        self.f_presets, self.f_folders = set(presets), list(folders)
+        for k, row in self.preset_rows.items():
+            row.set_active(k in presets)
+        self.filters_buf.set_text("\n".join(custom))
+        self._loading_filters = False
+        self._render_folder_rows()
+        self._filters_check()
+
+    def _filters_text(self) -> str:
         b = self.filters_buf
-        text = b.get_text(b.get_start_iter(), b.get_end_iter(), False)
-        bg(lambda: core.save_filters(text),
-           lambda _: self.toast("Exclusiones guardadas · la próxima sincronización hará un resync"), self.error)
+        custom = [l.strip() for l in b.get_text(b.get_start_iter(), b.get_end_iter(), False).splitlines() if l.strip()]
+        return core.build_filters(self.f_presets, self.f_folders, custom)
+
+    def _filters_check(self):
+        if getattr(self, "_loading_filters", False) or not hasattr(self, "_saved_filters"):
+            return
+        dirty = core.parse_filters(self._filters_text()) != core.parse_filters(self._saved_filters)
+        self.b_fs.set_sensitive(dirty and not self._busy)
+        self.b_fs.set_tooltip_text(core.BUSY_MSG if self._busy and dirty else "Guardar exclusiones")
+
+    def _on_preset(self, key: str, active: bool):
+        if getattr(self, "_loading_filters", False):
+            return
+        (self.f_presets.add if active else self.f_presets.discard)(key)
+        self._filters_check()
+
+    def _render_folder_rows(self):
+        for r in self.ffolder_rows:
+            self.g_ffolders.remove(r)
+        self.ffolder_rows = []
+        if not self.f_folders:
+            row = Adw.ActionRow(title="Ninguna", subtitle="Pulsa + para elegir una carpeta", css_classes=["dim-label"])
+            self.g_ffolders.add(row)
+            self.ffolder_rows.append(row)
+        for f in self.f_folders:
+            row = Adw.ActionRow(title=GLib.markup_escape_text(f.rsplit("/", 1)[-1]), subtitle=GLib.markup_escape_text(f))
+            row.add_prefix(Gtk.Image(icon_name="folder-symbolic"))
+            b = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER, css_classes=["flat"],
+                           tooltip_text="Volver a sincronizar esta carpeta")
+            b.connect("clicked", lambda _b, f=f: self._remove_excluded_folder(f))
+            row.add_suffix(b)
+            self.g_ffolders.add(row)
+            self.ffolder_rows.append(row)
+
+    def _remove_excluded_folder(self, f: str):
+        if f in self.f_folders:
+            self.f_folders.remove(f)
+        self._render_folder_rows()
+        self._filters_check()
+
+    def _add_excluded_folder(self, *_):
+        lp = core.read_config()["LOCAL_PATH"]
+        if not lp or not Path(lp).is_dir():
+            self.error("Primero configura la carpeta local (y conecta su disco)")
+            return
+        dlg = Gtk.FileDialog(title="Carpeta a excluir", modal=True, initial_folder=Gio.File.new_for_path(lp))
+
+        def done(d, res):
+            try:
+                f = d.select_folder_finish(res)
+            except GLib.Error:
+                return
+            if not f:
+                return
+            try:
+                rel = core.folder_rule_path(lp, f.get_path())
+            except core.CoreError as e:
+                self.error(e)
+                return
+            if rel not in self.f_folders:
+                self.f_folders.append(rel)
+                self._render_folder_rows()
+                self._filters_check()
+        dlg.select_folder(self, None, done)
+
+    def _confirm_save_filters(self, *_):
+        dlg = Adw.AlertDialog(heading="¿Guardar exclusiones?",
+                              body="La próxima sincronización revisará todo desde cero (resync). No se borra nada; "
+                                   "lo que ya esté en Drive y ahora quede excluido se mantiene allí.")
+        dlg.add_response("cancel", "Cancelar")
+        dlg.add_response("save", "Guardar")
+        dlg.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+        dlg.connect("response", lambda _d, r: r == "save" and self._save_filters())
+        dlg.present(self)
+
+    def _save_filters(self):
+        b = self.filters_buf
+        for l in b.get_text(b.get_start_iter(), b.get_end_iter(), False).splitlines():
+            l = l.strip()
+            if l and not l.startswith("#") and l[:2] not in ("- ", "+ "):
+                self.error(f"Regla avanzada inválida: «{l}». Debe empezar por «- » o «+ »")
+                return
+        text = self._filters_text()
+
+        def done(_):
+            self.toast("Exclusiones guardadas · la próxima sincronización hará un resync")
+            self._load_filters()
+        bg(lambda: core.save_filters(text), done, self.error)

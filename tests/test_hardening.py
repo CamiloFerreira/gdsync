@@ -258,6 +258,33 @@ class TestTracker(unittest.TestCase):
         self.assertEqual(len(t.changes), core.SyncTracker.MAX)
 
 
+class TestFilters(unittest.TestCase):
+    def test_default_filters_map_to_presets(self):
+        self.assertEqual(core.parse_filters(core.DEFAULT_FILTERS), ({"temp", "system", "gdrive"}, [], []))
+
+    def test_roundtrip_keeps_custom_rules_first(self):
+        text = core.build_filters({"dev"}, ["A/B"], ["+ importante/**"])
+        self.assertEqual(core.parse_filters(text), ({"dev"}, ["A/B"], ["+ importante/**"]))
+        rules = [l for l in text.splitlines() if l and not l.startswith("#")]
+        self.assertEqual(rules[0], "+ importante/**")
+        core.save_filters(text)  # el resultado pasa la validación
+
+    def test_partial_preset_stays_as_custom(self):
+        presets, _, custom = core.parse_filters("- *.tmp\n")
+        self.assertEqual((presets, custom), (set(), ["- *.tmp"]))
+
+    def test_folder_rule_path(self):
+        root = HOME / "Sync"
+        (root / "a b/c").mkdir(parents=True, exist_ok=True)
+        self.assertEqual(core.folder_rule_path(str(root), str(root / "a b/c")), "a b/c")
+        for bad in (str(root), str(HOME), str(root / "../x")):
+            with self.subTest(bad=bad), self.assertRaises(core.CoreError):
+                core.folder_rule_path(str(root), bad)
+        (root / "raro[1]").mkdir(exist_ok=True)
+        with self.assertRaises(core.CoreError):
+            core.folder_rule_path(str(root), str(root / "raro[1]"))
+
+
 class TestCLI(unittest.TestCase):
     def setUp(self):
         for unit in ("gdsync.service", "gdsync.timer"):

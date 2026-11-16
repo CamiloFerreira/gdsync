@@ -230,6 +230,64 @@ def read_filters() -> str:
     return FILTERS_FILE.read_text() if FILTERS_FILE.exists() else ""
 
 
+# Grupos de reglas que la app muestra como interruptores
+FILTER_PRESETS = {
+    "temp": ("Archivos temporales y de bloqueo", "Bloqueos de LibreOffice/Office, *.tmp, *.swp",
+             ["- .~lock.*", "- ~$*", "- *.tmp", "- *.swp"]),
+    "system": ("Archivos del sistema", "Papelera, .DS_Store, Thumbs.db, desktop.ini",
+               ["- .DS_Store", "- Thumbs.db", "- desktop.ini", "- .Trash-*/**"]),
+    "gdrive": ("Restos de Google Drive para escritorio", ".sync-exclude.lst y carpetas .tmp.drive*",
+               ["- .sync-exclude.lst", "- .tmp.drivedownload/**", "- .tmp.driveupload/**"]),
+    "dev": ("Carpetas de programación", "node_modules, .git, venv, __pycache__, site-packages… (miles de archivos pequeños)",
+            ["- node_modules/**", "- .git/**", "- .venv/**", "- venv/**", "- __pycache__/**", "- site-packages/**"]),
+}
+FILTERS_HEADER = "# Reglas de exclusión rclone (https://rclone.org/filtering/)"
+_RE_FOLDER_RULE = re.compile(r"^- /(.+)/\*\*$")
+
+
+def parse_filters(text: str) -> tuple[set[str], list[str], list[str]]:
+    """Separa el archivo de filtros en (presets activos, carpetas excluidas, reglas propias)."""
+    lines = [l.strip() for l in text.splitlines()]
+    rules = {l for l in lines if l and not l.startswith("#")}
+    presets = {k for k, (_, _, r) in FILTER_PRESETS.items() if set(r) <= rules}
+    taken = {r for k in presets for r in FILTER_PRESETS[k][2]}
+    folders, custom = [], []
+    for l in lines:
+        if not l or l.startswith("#") or l in taken:
+            continue
+        m = _RE_FOLDER_RULE.match(l)
+        if m and m.group(1) not in folders:
+            folders.append(m.group(1))
+        elif l not in custom:
+            custom.append(l)
+    return presets, folders, custom
+
+
+def build_filters(presets: set[str], folders: list[str], custom: list[str]) -> str:
+    """Inverso de parse_filters. Las reglas propias van primero: en rclone gana la primera que coincide."""
+    out = [FILTERS_HEADER]
+    if custom:
+        out += ["# Reglas propias"] + custom
+    for k, (title, _, rules) in FILTER_PRESETS.items():
+        if k in presets:
+            out += [f"# {title}"] + rules
+    if folders:
+        out += ["# Carpetas excluidas"] + [f"- /{f.strip('/')}/**" for f in folders]
+    return "\n".join(out) + "\n"
+
+
+def folder_rule_path(local_root: str, chosen: str) -> str:
+    """Ruta relativa (para «- /ruta/**») de una carpeta elegida dentro de la carpeta local."""
+    root = Path(os.path.realpath(local_root))
+    p = Path(os.path.realpath(chosen))
+    if p == root or root not in p.parents:
+        raise CoreError("Elige una carpeta dentro de tu carpeta sincronizada")
+    rel = p.relative_to(root).as_posix()
+    if any(c in rel for c in "*?[]{}\n\\"):
+        raise CoreError("Esa carpeta tiene caracteres especiales; agrégala en «Reglas avanzadas»")
+    return rel
+
+
 def save_filters(text: str) -> None:
     for i, line in enumerate(text.splitlines(), 1):
         s = line.strip()
