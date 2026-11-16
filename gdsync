@@ -279,7 +279,7 @@ bisync() {
     --max-lock 5m \
     --conflict-resolve newer --conflict-loser num \
     --drive-skip-gdocs \
-    --log-file "$LOG_FILE" --log-level INFO \
+    --log-file "$LOG_FILE" --log-level INFO --stats 10s \
     "$@"
 }
 

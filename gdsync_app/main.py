@@ -64,7 +64,10 @@ class App(Adw.Application):
         self.set_accels_for_action("app.sync", ["<Control>r"])
         self.hold()  # seguir vivo en la bandeja sin ventana
 
+        self.tracker = core.SyncTracker()
+        self.tracker.feed(core.tail(core.LOG_FILE, 4000))
         self.win = MainWindow(self)
+        self.win.update_changes(self.tracker)
         self.tray = Tray(APP_ID, "Google Drive Sync", str(core.ICONS_DIR), self.toggle_window)
         self._build_tray_menu()
         core.LogFollower(lambda lines: GLib.idle_add(self._on_log_lines, lines))
@@ -113,6 +116,10 @@ class App(Adw.Application):
             self.refresh()
         return True
 
+    def _syncing(self) -> bool:
+        job_sync = self.job is not None and self.job.kind in ("sync", "resync")
+        return job_sync or bool(self.status and self.status.service_running)
+
     def refresh(self):
         self._polling = True
 
@@ -132,6 +139,7 @@ class App(Adw.Application):
                         p.detail if p else "Revisa la pestaña Actividad.", urgent=True)
         self.prev_state = state
         self.win.update_status(st, job_sync or st.service_running)
+        self.win.update_progress(self.tracker, job_sync or st.service_running)
         self.tray.set_icon(TRAY_ICON["error" if self.blocked else state], self._tooltip(st, state))
         self._build_tray_menu()
         if st.configured and st.rclone and self._quota_remote != st.config["REMOTE_NAME"]:
@@ -231,6 +239,13 @@ class App(Adw.Application):
     def cancel_job(self):
         if self.job:
             self.job.cancel()
+
+    def stop_sync(self):
+        """Detiene la sincronización en curso, la haya lanzado la app o el timer."""
+        if self.job and self.job.kind in ("sync", "resync"):
+            self.job.cancel()
+            return
+        bg(core.stop_service, lambda _: (self.win.toast("Sincronización detenida"), self.refresh()), self.win.error)
 
     # ------------------------------------------------------------ config
     def on_config_saved(self, first_time: bool):
@@ -419,6 +434,11 @@ class App(Adw.Application):
 
     def _on_log_lines(self, lines):
         self.win.append_lines(lines)
+        n = len(self.tracker.changes)
+        if self.tracker.feed(lines):
+            self.win.update_progress(self.tracker, self._syncing())
+            if len(self.tracker.changes) != n or self.tracker.changes and n == self.tracker.MAX:
+                self.win.update_changes(self.tracker)
         # cambios en el log suelen indicar inicio/fin de sync automático
         if any("Bisync successful" in l or "Bisync aborted" in l or "bisync is IN BETA" in l or "Synching Path1" in l for l in lines):
             self.refresh()

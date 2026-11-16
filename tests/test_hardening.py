@@ -217,6 +217,47 @@ class TestDiagnose(unittest.TestCase):
             core.LOG_FILE.unlink()
 
 
+class TestTracker(unittest.TestCase):
+    LOG = [
+        '2026/11/15 22:34:23 INFO  : Synching Path1 "Mio{X}:/" with Path2 "/m/GoogleDrive/"',
+        "2026/11/15 22:34:23 INFO  : Copying Path2 files to Path1",
+        "2026/11/15 22:34:30 INFO  : a/b.txt: Copied (new)",
+        "2026/11/15 22:34:31 INFO  : a/c.burp.conflict1: Copied (new)",
+        "2026/11/15 22:34:31 INFO  : a/dir: Made directory with metadata (mtime=x)",
+        "Transferred:   \t    1.5 GiB / 3.651 GiB, 41%, 8.048 MiB/s, ETA 4m30s",
+        "Checks:             21216 / 21216, 100%, Listed 53230",
+        "Transferred:           12 / 33, 36%",
+    ]
+
+    def test_progress_and_changes(self):
+        t = core.SyncTracker()
+        t.feed(self.LOG)
+        self.assertTrue(t.running)
+        self.assertEqual((t.phase, t.direction, t.percent), ("Subiendo a Drive", "up", 41))
+        self.assertEqual((t.files_done, t.files_total, t.listed), (12, 33, 53230))
+        self.assertIn("1.5 GiB de 3.651 GiB (41 %)", t.summary())
+        self.assertIn("quedan 4m30s", t.summary())
+        self.assertEqual([(c.path, c.kind, c.direction) for c in t.changes],
+                         [("a/b.txt", "new", "up"), ("a/c.burp.conflict1", "conflict", "up")])
+        t.feed(["2026/11/15 22:40:00 INFO  : Bisync successful"])
+        self.assertFalse(t.running)
+        self.assertEqual(len(t.changes), 2)  # el historial de cambios se conserva
+
+    def test_bisync_conflict_and_download(self):
+        t = core.SyncTracker()
+        t.feed(['2026/11/15 10:00:00 INFO  : Synching Path1 "r:" with Path2 "/l/"',
+                "2026/11/15 10:00:01 NOTICE: - WARNING  New or changed in both paths  - doc.odt",
+                "2026/11/15 10:00:02 INFO  : - Path1    Do queued copies to - Path2",
+                "2026/11/15 10:00:03 INFO  : x.pdf: Copied (replaced existing)"])
+        self.assertEqual([(c.path, c.kind, c.direction) for c in t.changes],
+                         [("doc.odt", "conflict", None), ("x.pdf", "updated", "down")])
+
+    def test_history_is_capped(self):
+        t = core.SyncTracker()
+        t.feed([f"2026/11/15 10:00:00 INFO  : f{i}: Copied (new)" for i in range(core.SyncTracker.MAX + 50)])
+        self.assertEqual(len(t.changes), core.SyncTracker.MAX)
+
+
 class TestCLI(unittest.TestCase):
     def setUp(self):
         for unit in ("gdsync.service", "gdsync.timer"):

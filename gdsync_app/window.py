@@ -29,7 +29,22 @@ CSS = """
 .path-chip { padding: 5px 12px; border-radius: 999px; background: alpha(currentColor, .07); }
 .logview { font-family: monospace; font-size: 10pt; padding: 12px; }
 .filters { font-family: monospace; font-size: 10pt; }
+.sync-progress { min-width: 320px; }
 """
+
+CHANGE_UI = {  # (kind, dirección) -> (icono, texto)
+    ("new", "up"): ("go-up-symbolic", "Subido"), ("new", "down"): ("go-down-symbolic", "Descargado"),
+    ("updated", "up"): ("go-up-symbolic", "Actualizado en Drive"), ("updated", "down"): ("go-down-symbolic", "Actualizado aquí"),
+    ("deleted", "up"): ("user-trash-symbolic", "Borrado en Drive"), ("deleted", "down"): ("user-trash-symbolic", "Borrado aquí"),
+    ("moved", None): ("document-send-symbolic", "Movido"),
+    ("conflict", None): ("dialog-warning-symbolic", "Conflicto: se guardó una copia"),
+}
+
+
+def change_ui(c) -> tuple[str, str]:
+    return (CHANGE_UI.get((c.kind, c.direction)) or CHANGE_UI.get((c.kind, None))
+            or ({"new": ("document-new-symbolic", "Copiado"), "updated": ("document-edit-symbolic", "Actualizado"),
+                 "deleted": ("user-trash-symbolic", "Borrado")}.get(c.kind, ("document-symbolic", c.kind))))
 
 
 def bg(fn: Callable, done: Callable | None = None, err: Callable | None = None):
@@ -182,7 +197,18 @@ class MainWindow(Adw.ApplicationWindow):
         self.b_sync.connect("clicked", lambda *_: self.app.start_job("sync"))
         for b in (b_open, self.b_dry, self.b_sync):
             buttons.append(b)
-        for w in (self.hero_icon_box, self.hero_title, paths, buttons):
+        self.progress_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, visible=False,
+                                    halign=Gtk.Align.CENTER, css_classes=["sync-progress"])
+        self.progress_bar = Gtk.ProgressBar()
+        self.progress_label = Gtk.Label(css_classes=["caption"], wrap=True, justify=Gtk.Justification.CENTER)
+        self.progress_file = Gtk.Label(css_classes=["caption", "dim-label"], ellipsize=Pango.EllipsizeMode.MIDDLE,
+                                       max_width_chars=60)
+        for w in (self.progress_bar, self.progress_label, self.progress_file):
+            self.progress_box.append(w)
+        self.b_stop = Gtk.Button(label="Detener", css_classes=["pill", "destructive-action"], visible=False)
+        self.b_stop.connect("clicked", lambda *_: self.app.stop_sync())
+        buttons.append(self.b_stop)
+        for w in (self.hero_icon_box, self.hero_title, self.progress_box, paths, buttons):
             hero.append(w)
         g0 = Adw.PreferencesGroup()
         g0.add(hero)
@@ -206,7 +232,12 @@ class MainWindow(Adw.ApplicationWindow):
         self._auto_handler = self.row_auto.connect("notify::active", self._on_auto_toggled)
         self.row_next = Adw.ActionRow(title="Próxima ejecución", subtitle="—")
         self.row_last = Adw.ActionRow(title="Última sincronización", subtitle="—")
-        for r in (self.row_auto, self.row_next, self.row_last):
+        self.row_conflicts = Adw.ActionRow(title="Archivos con conflicto", subtitle_lines=3, visible=False)
+        self.row_conflicts.add_prefix(Gtk.Image(icon_name="dialog-warning-symbolic", css_classes=["warning"]))
+        b_conf = Gtk.Button(label="Ver", valign=Gtk.Align.CENTER)
+        b_conf.connect("clicked", lambda *_: self.show_changes())
+        self.row_conflicts.add_suffix(b_conf)
+        for r in (self.row_auto, self.row_next, self.row_last, self.row_conflicts):
             g1.add(r)
         page.add(g1)
 
@@ -555,7 +586,9 @@ class MainWindow(Adw.ApplicationWindow):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         bar = Gtk.Box(spacing=8, margin_start=12, margin_end=12, margin_top=10, margin_bottom=10)
         self.act_spinner = Gtk.Spinner()
-        self.act_title = Gtk.Label(label="Registro de sincronización", xalign=0, hexpand=True, css_classes=["heading"])
+        self.act_title = Gtk.Label(label="Actividad", xalign=0, hexpand=True, css_classes=["heading"])
+        self.act_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, vexpand=True)
+        act_switch = Gtk.StackSwitcher(stack=self.act_stack)
         self.b_cancel = Gtk.Button(label="Cancelar", css_classes=["destructive-action"], visible=False)
         self.b_cancel.connect("clicked", lambda *_: self.app.cancel_job())
         b_resync = Gtk.Button(label="Forzar resync", tooltip_text="Une ambos lados desde cero. Úsalo si la sincronización lo pide.")
@@ -563,7 +596,10 @@ class MainWindow(Adw.ApplicationWindow):
         self.b_resync = b_resync
         b_clear = Gtk.Button(icon_name="edit-clear-all-symbolic", tooltip_text="Limpiar vista", css_classes=["flat"])
         b_clear.connect("clicked", lambda *_: self.logbuf.set_text(""))
-        for w in (self.act_spinner, self.act_title, self.b_cancel, b_resync, b_clear):
+        self.b_clear = b_clear
+        self.act_stack.connect("notify::visible-child-name",
+                               lambda st, _p: b_clear.set_visible(st.get_visible_child_name() == "log"))
+        for w in (self.act_spinner, self.act_title, act_switch, self.b_cancel, b_resync, b_clear):
             bar.append(w)
         box.append(bar)
         box.append(Gtk.Separator())
@@ -574,7 +610,18 @@ class MainWindow(Adw.ApplicationWindow):
         self.logview = Gtk.TextView(buffer=self.logbuf, editable=False, cursor_visible=False, monospace=True,
                                     wrap_mode=Gtk.WrapMode.WORD_CHAR, css_classes=["logview"])
         self.log_scroll = Gtk.ScrolledWindow(child=self.logview, vexpand=True)
-        box.append(self.log_scroll)
+
+        # Cambios recientes: lista legible (lo más nuevo arriba)
+        self.changes_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"],
+                                        margin_start=12, margin_end=12, margin_top=12, margin_bottom=12, valign=Gtk.Align.START)
+        self.changes_list.set_placeholder(Adw.StatusPage(icon_name="document-open-recent-symbolic", title="Sin cambios recientes",
+                                                         description="Aquí verás los archivos que se suban, descarguen o borren."))
+        self.changes_list.connect("row-activated", lambda _l, row: self._open_change(row))
+        clamp = Adw.Clamp(child=self.changes_list, maximum_size=900)
+        self.act_stack.add_titled(Gtk.ScrolledWindow(child=clamp, vexpand=True), "changes", "Cambios")
+        self.act_stack.add_titled(self.log_scroll, "log", "Registro")
+        b_clear.set_visible(False)
+        box.append(self.act_stack)
         self.stack.add_titled_with_icon(box, "activity", "Actividad", "document-open-recent-symbolic")
         history = core.tail(core.LOG_FILE, 300)
         self.append_lines(history or ["Aún no hay actividad. Aquí verás cada sincronización en tiempo real."], scroll=True)
@@ -601,10 +648,57 @@ class MainWindow(Adw.ApplicationWindow):
         if at_bottom:
             GLib.idle_add(lambda: adj.set_value(adj.get_upper()) and False)
 
+    def show_changes(self):
+        self.stack.set_visible_child_name("activity")
+        self.act_stack.set_visible_child_name("changes")
+
+    def update_progress(self, t, syncing: bool):
+        self.progress_box.set_visible(syncing)
+        self.b_stop.set_visible(syncing)
+        if not syncing:
+            return
+        self.progress_label.set_label(t.summary())
+        if t.percent is not None and t.bytes_total and not t.bytes_total.startswith("0 "):
+            self.progress_bar.set_fraction(t.percent / 100)
+        else:
+            self.progress_bar.pulse()
+        self.progress_file.set_label(t.current.rsplit("/", 1)[-1] if t.current else "")
+        self.progress_file.set_tooltip_text(t.current or None)
+
+    def update_changes(self, t):
+        self.changes_list.remove_all()
+        for c in reversed(t.changes[-150:]):
+            icon, what = change_ui(c)
+            name = c.path.rsplit("/", 1)[-1]
+            folder = c.path.rsplit("/", 1)[0] if "/" in c.path else ""
+            row = Adw.ActionRow(title=GLib.markup_escape_text(name), activatable=c.kind != "deleted",
+                                subtitle=GLib.markup_escape_text(" · ".join(x for x in (what, folder, c.when[11:16]) if x)))
+            img = Gtk.Image(icon_name=icon)
+            if c.kind == "conflict":
+                img.add_css_class("warning")
+            row.add_prefix(img)
+            row._path = c.path
+            self.changes_list.append(row)
+        conflicts = [c for c in t.changes if c.kind == "conflict"]
+        self.row_conflicts.set_visible(bool(conflicts))
+        if conflicts:
+            n = len(conflicts)
+            self.row_conflicts.set_title(f"{n} archivo{'s' if n > 1 else ''} con conflicto")
+            self.row_conflicts.set_subtitle("Se editaron en ambos lados. Quedó la versión más nueva y la otra se guardó "
+                                            "como copia «.conflictN» junto a ella. Revísalas y borra la que sobre.")
+
+    def _open_change(self, row):
+        lp = (self.status.config if self.status else core.read_config()).get("LOCAL_PATH")
+        rel = getattr(row, "_path", "")
+        if not lp or not rel:
+            return
+        target = Path(lp) / rel
+        self.app.open_path(target.parent if target.parent.exists() else lp)
+
     def set_job(self, title: str | None):
         running = title is not None
         self.act_spinner.set_spinning(running)
-        self.act_title.set_label(title or "Registro de sincronización")
+        self.act_title.set_label(title or "Actividad")
         self.b_cancel.set_visible(running)
         self.b_resync.set_sensitive(not running)
 

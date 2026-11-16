@@ -324,6 +324,12 @@ def set_timer(enabled: bool) -> None:
         raise CoreError(last_err(r, "Error con systemd"))
 
 
+def stop_service() -> None:
+    r = run(["systemctl", "--user", "stop", f"{APP}.service"], timeout=30)
+    if r.returncode != 0:
+        raise CoreError(last_err(r, "No se pudo detener la sincronización"))
+
+
 def service_installed() -> bool:
     return (UNIT_DIR / f"{APP}.service").exists()
 
@@ -514,6 +520,131 @@ def get_status() -> Status:
         st.problem = Diagnosis("La última sincronización falló", "Revisa la pestaña Actividad para ver el detalle.")
     st.shared_client_id = uses_shared_client_id(run_lines or lines[-200:])
     return st
+
+
+# ------------------------------------------------------- progreso/cambios
+
+PHASES = (  # (texto en el log de rclone bisync, fase legible, dirección de las copias)
+    ("Synching Path1", "Revisando archivos", None),
+    ("Building Path1 and Path2 listings", "Revisando archivos", None),
+    ("checking for diffs", "Buscando cambios", None),
+    ("Copying Path2 files to Path1", "Subiendo a Drive", "up"),
+    ("Copying Path1 files to Path2", "Descargando de Drive", "down"),
+    ("Applying changes", "Aplicando cambios", None),
+    ("queued copies to - Path1", "Subiendo a Drive", "up"),
+    ("queued copies to - Path2", "Descargando de Drive", "down"),
+    ("queued deletes on - Path1", "Borrando en Drive", "up"),
+    ("queued deletes on - Path2", "Borrando en este equipo", "down"),
+    ("Updating listings", "Guardando estado", None),
+)
+_RE_BYTES = re.compile(r"^Transferred:\s+([\d.]+ \S*B) / ([\d.]+ \S*B), (\d+)%(?:, ([\d.]+ \S*B/s), ETA (\S+))?")
+_RE_FILES = re.compile(r"^Transferred:\s+(\d+) / (\d+), (\d+)%\s*$")
+_RE_CHECKS = re.compile(r"^Checks:\s+(\d+) / (\d+), (\d+)%(?:, Listed (\d+))?")
+_RE_ITEM = re.compile(r"^(\S+ \S+) INFO  : (.+): (Copied \(new\)|Copied \(replaced existing\)|Updated [^:]*|Deleted|"
+                      r"Moved[^:]*|Made directory[^:]*|Removing directory)$")
+_RE_CONFLICT_COPY = re.compile(r"\.conflict\d+(\.[^/]*)?$")
+_RE_CONFLICT = re.compile(r"New or changed in both paths\s+-\s+(.+?)\s*$")
+
+
+@dataclass
+class Change:
+    when: str
+    path: str
+    kind: str          # new | updated | deleted | moved | dir | conflict
+    direction: str | None  # up | down | None
+
+
+class SyncTracker:
+    """Lee las líneas de sync.log y mantiene progreso, cambios recientes y conflictos."""
+
+    MAX = 300
+
+    def __init__(self):
+        self.changes: list[Change] = []
+        self.reset()
+
+    def reset(self):
+        self.running = False
+        self.phase = ""
+        self.direction: str | None = None
+        self.current = ""
+        self.bytes_done = self.bytes_total = ""
+        self.percent: int | None = None
+        self.speed = self.eta = ""
+        self.files_done = self.files_total = 0
+        self.checks = self.listed = 0
+        self.run_conflicts: list[str] = []
+
+    def feed(self, lines: list[str]) -> bool:
+        """Procesa líneas; True si algo visible cambió."""
+        changed = False
+        for line in lines:
+            changed |= self._line(line)
+        return changed
+
+    def _add(self, ch: Change):
+        self.changes.append(ch)
+        del self.changes[:-self.MAX]
+
+    def _line(self, line: str) -> bool:
+        if any(k in line for k in RESULT_OK + RESULT_BAD):
+            self.reset()
+            return True
+        for key, phase, direction in PHASES:
+            if key in line:
+                if key in ("Synching Path1", "Building Path1 and Path2 listings") and not self.running:
+                    self.reset()  # empieza una ejecución nueva
+                self.running = True
+                self.phase, self.direction = phase, direction
+                return True
+        line_s = line.strip()
+        m = _RE_BYTES.match(line_s)
+        if m:
+            self.running = True
+            self.bytes_done, self.bytes_total, pct, self.speed, self.eta = m.group(1), m.group(2), m.group(3), m.group(4) or "", m.group(5) or ""
+            self.percent = int(pct)
+            return True
+        m = _RE_FILES.match(line_s)
+        if m:
+            self.files_done, self.files_total = int(m.group(1)), int(m.group(2))
+            return True
+        m = _RE_CHECKS.match(line_s)
+        if m:
+            self.checks, self.listed = int(m.group(1)), int(m.group(4) or 0)
+            return True
+        m = _RE_CONFLICT.search(line)
+        if m:
+            path = m.group(1)
+            if path not in self.run_conflicts:
+                self.run_conflicts.append(path)
+            self._add(Change(line[:19], path, "conflict", None))
+            return True
+        m = _RE_ITEM.match(line)
+        if m:
+            when, path, what = m.groups()
+            kind = ("new" if what.startswith("Copied (new") else "updated" if what.startswith(("Copied", "Updated"))
+                    else "deleted" if what.startswith(("Deleted", "Removing")) else "moved" if what.startswith("Moved")
+                    else "dir")
+            self.current = path
+            if kind != "deleted" and _RE_CONFLICT_COPY.search(path):
+                kind = "conflict"  # copia «.conflictN» que deja --conflict-loser num
+            if kind != "dir":
+                self._add(Change(when, path, kind, self.direction))
+            return True
+        return False
+
+    def summary(self) -> str:
+        """Texto corto del progreso: «Subiendo a Drive · 1.2 GiB de 3.6 GiB (33 %) · 8 MiB/s · quedan 2m»."""
+        parts = [self.phase or "Sincronizando"]
+        if self.bytes_total and self.percent is not None and not self.bytes_total.startswith("0 "):
+            parts.append(f"{self.bytes_done} de {self.bytes_total} ({self.percent} %)")
+            if self.speed and not self.speed.startswith("0 "):
+                parts.append(self.speed)
+            if self.eta and self.eta not in ("-", "0s"):
+                parts.append(f"quedan {self.eta}")
+        elif self.listed:
+            parts.append(f"{self.listed} archivos revisados")
+        return " · ".join(parts)
 
 
 # -------------------------------------------------------------------- jobs
