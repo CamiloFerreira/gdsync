@@ -45,6 +45,7 @@ class App(Adw.Application):
         self.blocked = False
         self._mandatory_dlg = None
         self._updating = False
+        self._checking = False
 
     # --------------------------------------------------------- arranque
     def do_startup(self):
@@ -53,7 +54,8 @@ class App(Adw.Application):
         Gtk.Window.set_default_icon_name(APP_ID)
         for name, cb in (("quit", lambda *_: self.quit_app()), ("open-folder", lambda *_: self.open_folder()),
                          ("about", lambda *_: self.about()), ("show", lambda *_: self.show_window()),
-                         ("sync", lambda *_: self.start_job("sync"))):
+                         ("sync", lambda *_: self.start_job("sync")),
+                         ("check-updates", lambda *_: self.check_updates_now())):
             a = Gio.SimpleAction.new(name, None)
             a.connect("activate", cb)
             self.add_action(a)
@@ -156,6 +158,8 @@ class App(Adw.Application):
             items = [MenuItem("⚠ Actualización de seguridad obligatoria", self.show_mandatory)]
         elif self.update and self.update.available:
             items.append(MenuItem(f"Actualizar a {self.update.latest}", self.do_update, enabled=not self._updating))
+        else:
+            items.append(MenuItem("Buscar actualizaciones", self.check_updates_now, enabled=not self._checking))
         if st and st.last_sync:
             items.append(MenuItem(f"Última: {core.fmt_rel(st.last_sync)}", enabled=False))
         items += [
@@ -255,8 +259,37 @@ class App(Adw.Application):
         bg(updater.check, lambda info: info and self._on_update_info(info))
         return True
 
+    def check_updates_now(self):
+        """Comprobación manual (botón): avisa también si ya está al día."""
+        if self._checking or self._updating:
+            return
+        self._checking = True
+        self.win.refresh_update_row(self.update, checking=True)
+        self._menu_sig = None
+
+        def done(info):
+            self._checking = False
+            if info:
+                self._on_update_info(info)
+                if not info.available:
+                    if self.win.get_visible():
+                        self.win.toast("Ya tienes la última versión")
+                    else:
+                        self.notify("gdsync está al día", f"Versión {info.current}")
+            else:
+                self.win.refresh_update_row(self.update)
+                self.win.error("No se pudo comprobar si hay actualizaciones")
+        bg(updater.check, done, lambda e: done(None))
+
+    def update_button_clicked(self):
+        if self.update and self.update.available:
+            self.do_update()
+        else:
+            self.check_updates_now()
+
     def _on_update_info(self, info: updater.UpdateInfo):
         self.update = info
+        self.win.refresh_update_row(info)
         was_blocked = self.blocked
         self.blocked = info.mandatory
         if info.mandatory:
@@ -312,6 +345,7 @@ class App(Adw.Application):
             self.win.toast("Instalación desde código fuente: actualiza con «git pull»", timeout=6)
             return
         self._updating = True
+        self.win.refresh_update_row(info, updating=True)
         self.win.update_banner_progress(0)
 
         def progress(f):
@@ -328,11 +362,13 @@ class App(Adw.Application):
 
         def fail(e):
             self._updating = False
+            self.win.refresh_update_row(info)
             self.win.show_update_banner(info, mandatory=info.mandatory)
             self.win.error(f"No se pudo actualizar: {e}")
             if info.mandatory:
                 GLib.timeout_add(500, lambda: self.show_mandatory() and False)
-        bg(lambda: updater.apply(info, progress), done, fail)
+        # Releer update.json justo antes: la info en memoria puede tener hashes viejos
+        bg(lambda: updater.apply(updater.check() or info, progress), done, fail)
 
     def open_folder(self):
         lp = core.read_config()["LOCAL_PATH"]

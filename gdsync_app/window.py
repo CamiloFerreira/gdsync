@@ -72,6 +72,7 @@ class MainWindow(Adw.ApplicationWindow):
         header.set_title_widget(switcher)
         menu = Gio.Menu()
         menu.append("Abrir carpeta local", "app.open-folder")
+        menu.append("Buscar actualizaciones", "app.check-updates")
         menu.append("Acerca de", "app.about")
         menu.append("Salir", "app.quit")
         header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu, tooltip_text="Menú"))
@@ -128,6 +129,24 @@ class MainWindow(Adw.ApplicationWindow):
 
     def hide_update_banner(self):
         self.banner.set_revealed(False)
+
+    def refresh_update_row(self, info, checking: bool = False, updating: bool = False):
+        from . import __version__
+        if updating:
+            sub, label = f"Versión {__version__} · instalando {info.latest}…", "Actualizando…"
+        elif checking:
+            sub, label = f"Versión {__version__} · buscando…", "Buscando…"
+        elif info and info.available:
+            sub, label = f"Versión {__version__} · disponible {info.latest}", f"Actualizar a {info.latest}"
+        else:
+            sub, label = f"Versión {__version__} · estás al día" if info else f"Versión {__version__}", "Buscar actualizaciones"
+        self.row_app_update.set_subtitle(GLib.markup_escape_text(sub))
+        self.b_app_update.set_sensitive(not (checking or updating))
+        self.b_app_update.set_label(label)
+        if info and info.available and not checking and not updating:
+            self.b_app_update.add_css_class("suggested-action")
+        else:
+            self.b_app_update.remove_css_class("suggested-action")
 
     # ============================================================== ESTADO
     def _build_status(self):
@@ -552,6 +571,16 @@ class MainWindow(Adw.ApplicationWindow):
                           css_classes=["card"])
         g_f.add(frame)
         page.add(g_f)
+
+        g_upd = Adw.PreferencesGroup(title="Actualizaciones")
+        self.row_app_update = Adw.ActionRow(title="gdsync", subtitle="—")
+        self.row_app_update.add_prefix(Gtk.Image(icon_name="software-update-available-symbolic"))
+        self.b_app_update = Gtk.Button(label="Buscar actualizaciones", valign=Gtk.Align.CENTER)
+        self.b_app_update.connect("clicked", lambda *_: self.app.update_button_clicked())
+        self.row_app_update.add_suffix(self.b_app_update)
+        g_upd.add(self.row_app_update)
+        page.add(g_upd)
+        self.refresh_update_row(None)
 
         g_adv = Adw.PreferencesGroup(title="Avanzado")
         self.row_rclone = Adw.ActionRow(title="rclone", subtitle="—")
