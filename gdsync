@@ -13,6 +13,8 @@ LOG_FILE="$STATE_DIR/sync.log"
 BIN_DIR="$HOME/.local/bin"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 RCLONE_MIN="1.66.0"
+POSTPONE_MAX=3600      # como mucho 1 h de espera por archivos en uso
+BUSY_AGE=90            # un archivo modificado hace menos de esto se está escribiendo
 SELF="$(readlink -f "$0")"
 SELF_DIR="$(dirname "$SELF")"
 VERSION="$(cat "$SELF_DIR/VERSION" 2>/dev/null || echo 0.0.0)"
@@ -309,6 +311,98 @@ security_gate() {
   fi
 }
 
+# Archivos en uso dentro de LOCAL_PATH: bloqueos de editores (LibreOffice, MS Office,
+# vim, emacs), archivos abiertos para escritura por algún proceso o modificados hace
+# menos de BUSY_AGE s. Imprime rutas relativas (máx. 5). Sin salida = nada en uso.
+busy_files() {
+  python3 - "$LOCAL_PATH" "$BUSY_AGE" <<'PY' 2>/dev/null || true
+import os, re, sys, time
+root, age = os.path.realpath(sys.argv[1]), int(sys.argv[2])
+lock = re.compile(r"^(\.~lock\.(?P<lo>.+)#|~\$(?P<ms>.+)|\.(?P<vi>.+)\.sw[op]|\.#(?P<em>.+))$")
+found, now = [], time.time()
+def add(path):
+    rel = os.path.relpath(path, root)
+    if rel not in found:
+        found.append(rel)
+for dp, dn, fn in os.walk(root):
+    for f in fn:
+        try:
+            mtime = os.lstat(os.path.join(dp, f)).st_mtime
+        except OSError:
+            continue
+        m = lock.match(f)
+        if m:
+            if now - mtime < 12 * 3600:  # bloqueo huérfano (editor que se cerró mal): se ignora
+                add(os.path.join(dp, next(g for g in m.groups()[1:] if g)))
+        elif now - mtime < age:
+            add(os.path.join(dp, f))
+for pid in filter(str.isdigit, os.listdir("/proc")):
+    fddir = f"/proc/{pid}/fd"
+    try:
+        fds = os.listdir(fddir)
+    except OSError:
+        continue
+    for fd in fds:
+        try:
+            target = os.readlink(f"{fddir}/{fd}")
+            if not target.startswith(root + "/"):
+                continue
+            with open(f"/proc/{pid}/fdinfo/{fd}") as fi:
+                flags = int(next(l for l in fi if l.startswith("flags:")).split()[1], 8)
+            if flags & 3:  # O_WRONLY u O_RDWR
+                add(target)
+        except (OSError, StopIteration, ValueError):
+            pass
+if found:
+    print("\n".join(found[:5]))
+PY
+}
+
+# Pospone el sync mientras haya archivos en uso (hasta POSTPONE_MAX). 0 = sincronizar ya.
+postpone_if_busy() {
+  if [[ "${GDSYNC_FORCE:-}" == 1 || -f "$STATE_DIR/force-once" ]]; then
+    rm -f "$STATE_DIR/postponed" "$STATE_DIR/force-once"
+    return 1
+  fi
+  load_config
+  [[ -d "$LOCAL_PATH" ]] || return 1
+  local busy now since
+  busy="$(busy_files)"
+  if [[ -z "$busy" ]]; then
+    rm -f "$STATE_DIR/postponed"
+    return 1
+  fi
+  now=$(date +%s)
+  since=$(cat "$STATE_DIR/postponed" 2>/dev/null || true)
+  [[ "$since" =~ ^[0-9]+$ ]] || { since=$now; printf '%s' "$now" > "$STATE_DIR/postponed"; }
+  if (( now - since >= POSTPONE_MAX )); then
+    warn "Hay archivos en uso desde hace más de $((POSTPONE_MAX / 60)) min: sincronizo igualmente"
+    rm -f "$STATE_DIR/postponed"
+    return 1
+  fi
+  local first="${busy%%$'\n'*}"
+  printf '%s gdsync NOTICE: Sync pospuesto: archivo en uso: %s\n' "$(date '+%Y/%m/%d %H:%M:%S')" "$first" >> "$LOG_FILE"
+  info "Sync pospuesto: hay archivos en uso (se reintenta en la próxima ronda):"
+  printf '    %s\n' "$busy"
+  return 0
+}
+
+# Drive admite varios archivos con el mismo nombre en una carpeta; rclone los ignora
+# («Duplicate object found») y Drive para Windows/macOS los baja como «x (1)», «x (2)»…
+# que vuelven a subir en cada ronda. Si el último sync los vio, se deja uno solo en Drive:
+# el más reciente (los demás van a la papelera de Drive) y las carpetas repetidas se unen.
+dedupe_remote() {
+  local from="$1" size
+  size=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
+  (( size < from )) && from=0   # el log rotó durante el sync
+  tail -c +"$((from + 1))" "$LOG_FILE" 2>/dev/null | grep -q "Duplicate object found" || return 0
+  info "Drive tiene archivos repetidos con el mismo nombre: dejando solo el más reciente…"
+  rclone dedupe --dedupe-mode newest "$REMOTE_NAME:$REMOTE_PATH" \
+    --drive-skip-gdocs --drive-use-trash \
+    --log-file "$LOG_FILE" --log-level INFO \
+    || warn "No se pudieron quitar los repetidos de Drive (se reintenta en el próximo sync)"
+}
+
 cmd_sync() {
   mkdir -p "$STATE_DIR"
   SYNC_LOG="$LOG_FILE"   # los errores de gdsync también van al log que lee la app
@@ -319,8 +413,14 @@ cmd_sync() {
     info "Primer sync: --resync (une ambos lados, no borra nada)"
     extra+=(--resync)
   fi
+  if postpone_if_busy; then
+    return 0
+  fi
+  local log_from
+  log_from=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
   if bisync "${extra[@]}" "$@"; then
     info "Sync OK ($(date '+%F %T'))"
+    dedupe_remote "$log_from"
   else
     local rc=$?
     warn "Sync falló (código $rc). Revisa: $APP logs"

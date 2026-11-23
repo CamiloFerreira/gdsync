@@ -479,6 +479,7 @@ class Status:
     has_account: bool = False
     problem: "Diagnosis | None" = None
     shared_client_id: bool = False
+    postponed: str | None = None   # archivo en uso que hizo posponer el último sync
 
     @property
     def state(self) -> str:
@@ -495,6 +496,7 @@ class Status:
 
 
 LOG_TS = re.compile(r"^(\d{4}/\d\d/\d\d \d\d:\d\d:\d\d)")
+POSTPONED = "Sync pospuesto: archivo en uso:"  # lo escribe gdsync al esperar por un archivo abierto
 # Línea que cierra una ejecución (las escribe rclone, o gdsync al abortar antes de rclone)
 RESULT_OK = ("Bisync successful",)
 RESULT_BAD = ("Bisync aborted", "Bisync critical error", "gdsync ERROR:")
@@ -615,6 +617,12 @@ def get_status() -> Status:
             m = LOG_TS.match(line)
             if m:
                 st.last_sync = datetime.strptime(m.group(1), "%Y/%m/%d %H:%M:%S")
+            break
+    for line in reversed(lines):
+        if _is_result(line):
+            break
+        if POSTPONED in line:
+            st.postponed = line.split(POSTPONED, 1)[1].strip()
             break
     run_lines = last_run_lines(lines)
     if st.last_ok is False:
@@ -787,6 +795,14 @@ class Job:
             if self.kind == "sync" and self.cmd[:2] == ["systemctl", "--user"]:
                 run(["systemctl", "--user", "stop", f"{APP}.service"], timeout=20)
             self.proc.terminate()
+
+
+FORCE_ONCE = STATE_DIR / "force-once"  # el próximo sync no espera por archivos en uso
+
+
+def request_force_sync() -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    FORCE_ONCE.touch()
 
 
 def job_command(kind: str, arg: str = "") -> list[str]:

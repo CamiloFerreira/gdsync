@@ -435,11 +435,47 @@ class App(Adw.Application):
 
         def done(issues):
             self._scanning = False
-            self.set_issues(issues)
+            if issues and self.settings_get("auto_clean", True) and not self._syncing():
+                self.auto_clean(issues)
+            else:
+                self.set_issues(issues)
 
         def fail(_e):
             self._scanning = False
         bg(conflicts.scan, done, fail)
+
+    def auto_clean(self, issues: list):
+        """Resuelve solo lo que se pueda (más reciente gana) y sincroniza para llevarlo a Drive."""
+        self._scanning = True
+
+        def done(res):
+            self._scanning = False
+            n = res["conflicts"] + res["duplicates"]
+            for e in res["errors"]:
+                self.win.append_lines([f"[!] Limpieza automática: {e}"])
+            if n:
+                parts = ([f"{res['duplicates']} duplicado(s)"] if res["duplicates"] else []) + (
+                    [f"{res['conflicts']} conflicto(s)"] if res["conflicts"] else [])
+                msg = "Limpieza automática: " + " y ".join(parts) + " resueltos"
+                self.win.append_lines([f"✔ {msg} (lo quitado está en la papelera)"])
+                self.notify(msg, "Se conservó la versión más reciente. Lo quitado está en la papelera.")
+                if not self.job and not self._syncing():
+                    self.start_job("sync")  # llevar los cambios a Drive ya
+            # lo que quede (en uso o con error) se muestra para decidir a mano
+            bg(conflicts.scan, self.set_issues, lambda _e: None)
+
+        def fail(e):
+            self._scanning = False
+            self.win.append_lines([f"[!] Limpieza automática: {e}"])
+        bg(lambda: conflicts.auto_clean(issues), done, fail)
+
+    def force_sync(self):
+        try:
+            core.request_force_sync()
+        except OSError as e:
+            self.win.error(e)
+            return
+        self.start_job("sync")
 
     def set_issues(self, issues: list):
         keys = {i.key for i in issues}

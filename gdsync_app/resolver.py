@@ -416,10 +416,7 @@ class ResolverDialog(Adw.Dialog):
 
     @staticmethod
     def _clean(e: cf.Entry) -> str:
-        if e.is_dir:
-            return cf.portable_name(cf.DUP_SUFFIX.sub("", e.name))
-        stem, ext = os.path.splitext(e.name)
-        return cf.portable_name(cf.DUP_SUFFIX.sub("", stem) + ext)
+        return cf.clean_name(e)
 
     def show_preview(self, e: cf.Entry):
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)

@@ -553,6 +553,47 @@ class TestConflicts(unittest.TestCase):
         (self.root / "i.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 20)
         self.assertEqual(conflicts.preview(self.root / "i.png")["kind"], "image")
 
+    def old(self, rel, text, days):
+        p = self.w(rel, text)
+        t = time.time() - days * 86400
+        os.utime(p, (t, t))
+        return p
+
+    def test_auto_clean_keeps_newest(self):
+        self.old("doc.txt", "vieja", 2)
+        self.old("doc.conflict1.txt", "nueva", 1)          # la copia es más reciente
+        self.old("same.txt", "x", 2)
+        self.old("same.conflict1.txt", "x", 1)             # idénticas
+        self.old("foto.jpg", "a", 3)
+        self.old("foto (1).jpg", "b", 1)                    # la variante es la más reciente
+        self.old("foto (1) (1).jpg", "c", 2)
+        self.old("Info: x/a.txt", "igual", 3)
+        self.old("Info: x/b.txt", "nuevo", 1)
+        self.old("Info  x/a.txt", "igual", 3)
+        self.old("Info  x/b.txt", "viejo", 2)
+        self.old("Info  x (1)/c.txt", "solo", 3)
+        res = conflicts.auto_clean()
+        self.assertEqual((res["conflicts"], res["duplicates"], res["errors"]), (2, 2, []))
+        self.assertEqual((self.root / "doc.txt").read_text(), "nueva")
+        self.assertEqual((self.root / "same.txt").read_text(), "x")
+        self.assertEqual((self.root / "foto.jpg").read_text(), "b")
+        names = sorted(p.name for p in self.root.iterdir())
+        self.assertEqual(names, ["Info  x", "doc.txt", "foto.jpg", "same.txt"])
+        d = self.root / "Info  x"
+        self.assertEqual({p.name: p.read_text() for p in d.iterdir()}, {"a.txt": "igual", "b.txt": "nuevo", "c.txt": "solo"})
+        self.assertEqual(conflicts.scan(), [])
+        self.assertTrue(len(os.listdir(self.trash)) >= 5)  # nada se borró sin pasar por la papelera
+
+    def test_auto_clean_skips_files_in_use(self):
+        self.old("a.txt", "1", 2)
+        self.w("a (1).txt", "2")                             # recién modificado
+        self.old("b.odt", "1", 2)
+        self.old("b (1).odt", "2", 1)
+        self.w(".~lock.b.odt#", "")                          # abierto en LibreOffice
+        res = conflicts.auto_clean()
+        self.assertEqual((res["duplicates"], res["skipped"]), (0, 2))
+        self.assertTrue((self.root / "a (1).txt").exists() and (self.root / "b (1).odt").exists())
+
     def test_drive_url(self):
         fake = HOME / ".local/bin/rclone"
         fake.parent.mkdir(parents=True, exist_ok=True)
@@ -579,6 +620,92 @@ class TestConflicts(unittest.TestCase):
                 conflicts.drive_url(HOME / "fuera.txt")
         finally:
             fake.unlink()
+
+
+class TestBusyAndDedupe(unittest.TestCase):
+    """Espera por archivos en uso y limpieza de repetidos en Drive (CLI)."""
+    FUNCS = ("busy_files", "postpone_if_busy", "dedupe_remote", "load_config", "info", "warn")
+
+    def setUp(self):
+        import shutil
+        self.root = HOME / "BusySync"
+        shutil.rmtree(self.root, ignore_errors=True)
+        self.root.mkdir()
+        self.state = TMP / "busystate"
+        shutil.rmtree(self.state, ignore_errors=True)
+        self.state.mkdir()
+        core.write_config({"REMOTE_NAME": "gdrive", "REMOTE_PATH": "X", "LOCAL_PATH": str(self.root), "INTERVAL": "5min"})
+
+    def bash(self, body, **env):
+        funcs = "; ".join(f"source <(sed -n '/^{f}()/,/^}}/p' {GDSYNC})" for f in self.FUNCS)
+        script = (f"{funcs}; CONFIG_FILE={core.CONFIG_FILE}; STATE_DIR={self.state}; LOG_FILE={self.state}/sync.log; "
+                  f"BUSY_AGE=90; POSTPONE_MAX=3600; {body}")
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30,
+                              env={**os.environ, **env})
+
+    def mk(self, rel, age_s=86400):
+        p = self.root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x")
+        os.utime(p, (time.time() - age_s,) * 2)
+        return p
+
+    def busy(self):
+        return self.bash(f"LOCAL_PATH={self.root}; busy_files").stdout.split("\n")
+
+    def test_busy_files(self):
+        self.mk("viejo.txt")
+        self.assertEqual(self.busy(), [""])
+        self.mk("d/inf.odt")
+        self.mk("d/.~lock.inf.odt#", age_s=60)
+        self.mk("d/.~lock.huerfano.odt#", age_s=2 * 86400)   # bloqueo huérfano: se ignora
+        self.mk("nuevo.txt", age_s=5)                        # escribiéndose
+        held = self.mk("abierto.txt")
+        with open(held, "a"):                                # abierto para escritura
+            out = self.busy()
+        self.assertEqual(sorted(x for x in out if x), ["abierto.txt", "d/inf.odt", "nuevo.txt"])
+
+    def test_postpone_then_force(self):
+        self.mk("d/.~lock.inf.odt#", age_s=60)
+        r = self.bash("postpone_if_busy && echo POSPUESTO")
+        self.assertIn("POSPUESTO", r.stdout)
+        self.assertIn("Sync pospuesto: archivo en uso: d/inf.odt", (self.state / "sync.log").read_text())
+        (self.state / "force-once").touch()
+        self.assertNotIn("POSPUESTO", self.bash("postpone_if_busy && echo POSPUESTO").stdout)
+        self.assertFalse((self.state / "force-once").exists())
+        # tras POSTPONE_MAX esperando, sincroniza igualmente
+        (self.state / "postponed").write_text(str(int(time.time()) - 4000))
+        self.assertNotIn("POSPUESTO", self.bash("postpone_if_busy && echo POSPUESTO").stdout)
+
+    def test_status_shows_postponed(self):
+        core.LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        core.LOG_FILE.write_text("2026/11/23 10:00:00 INFO  : Bisync successful\n"
+                                 "2026/11/23 10:05:00 gdsync NOTICE: Sync pospuesto: archivo en uso: a/b.odt\n")
+        self.assertEqual(core.get_status().postponed, "a/b.odt")
+        with core.LOG_FILE.open("a") as f:
+            f.write("2026/11/23 10:10:00 INFO  : Bisync successful\n")
+        self.assertIsNone(core.get_status().postponed)
+
+    def test_dedupe_only_when_drive_has_duplicates(self):
+        fakebin = TMP / "dedupebin"
+        fakebin.mkdir(exist_ok=True)
+        calls = TMP / "rclone-calls"
+        calls.unlink(missing_ok=True)
+        (fakebin / "rclone").write_text(f'#!/bin/sh\necho "$@" >> {calls}\n')
+        (fakebin / "rclone").chmod(0o755)
+        log = self.state / "sync.log"
+        log.write_text("old: Duplicate object found in source - ignoring\n")
+        env = {"PATH": f"{fakebin}:{os.environ['PATH']}"}
+        start = log.stat().st_size
+        with log.open("a") as f:
+            f.write("INFO  : Bisync successful\n")
+        self.bash(f"REMOTE_NAME=gdrive REMOTE_PATH=X dedupe_remote {start}", **env)
+        self.assertFalse(calls.exists())                     # el aviso era de una ronda anterior
+        start = log.stat().st_size
+        with log.open("a") as f:
+            f.write("NOTICE: a.class: Duplicate object found in source - ignoring\n")
+        self.bash(f"REMOTE_NAME=gdrive REMOTE_PATH=X dedupe_remote {start}", **env)
+        self.assertIn("dedupe --dedupe-mode newest gdrive:X", calls.read_text())
 
 
 if __name__ == "__main__":

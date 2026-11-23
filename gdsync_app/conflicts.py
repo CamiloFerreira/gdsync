@@ -131,7 +131,7 @@ def _entry(p: Path, st: os.stat_result | None = None) -> Entry:
     st = st or p.lstat()
     e = Entry(p, stat.S_ISDIR(st.st_mode), mtime=datetime.fromtimestamp(st.st_mtime))
     if e.is_dir:
-        latest = st.st_mtime
+        latest = 0.0  # fecha de los archivos: la de la carpeta cambia con cada sync
         for dp, _dn, fn in os.walk(p):
             for f in fn:
                 try:
@@ -141,7 +141,7 @@ def _entry(p: Path, st: os.stat_result | None = None) -> Entry:
                 e.files += 1
                 e.size += s.st_size
                 latest = max(latest, s.st_mtime)
-        e.mtime = datetime.fromtimestamp(latest)
+        e.mtime = datetime.fromtimestamp(latest or st.st_mtime)
     else:
         e.size = st.st_size
     return e
@@ -315,17 +315,22 @@ def resolve_conflict(issue: Issue, action: str, new_name: str = "") -> str:
     raise core.CoreError(f"Acción desconocida: {action}")
 
 
-def merge_into(src: Path, dst: Path) -> dict:
+def _newer(a: Path, b: Path) -> bool:
+    return a.stat().st_mtime > b.stat().st_mtime
+
+
+def merge_into(src: Path, dst: Path, newest: bool = False) -> dict:
     """Mueve el contenido de la carpeta src a dst y manda src a la papelera.
 
-    Archivos idénticos se descartan; los que difieren se guardan como copia en
-    conflicto (nombre.conflictN.ext) para decidir después. Nada se borra sin pasar por la papelera.
+    Archivos idénticos se descartan. Los que difieren se guardan como copia en
+    conflicto (nombre.conflictN.ext) para decidir después o, con newest=True, gana
+    el más reciente. Nada se borra sin pasar por la papelera.
     """
     root = local_root()
     src, dst = ensure_inside(src, root), ensure_inside(dst, root)
     if not src.is_dir() or not dst.is_dir() or src == dst or src in dst.parents or dst in src.parents:
         raise core.CoreError("Solo se pueden unir dos carpetas distintas")
-    stats = {"moved": 0, "same": 0, "conflicts": 0}
+    stats = {"moved": 0, "same": 0, "conflicts": 0, "replaced": 0}
     for dirpath, dirnames, filenames in os.walk(src):
         rel = Path(dirpath).relative_to(src)
         tdir = dst / rel
@@ -344,6 +349,11 @@ def merge_into(src: Path, dst: Path) -> dict:
                 stats["moved"] += 1
             elif t.is_file() and same_content(s, t):
                 stats["same"] += 1
+            elif newest and t.is_file():
+                if _newer(s, t):
+                    trash(t)
+                    os.rename(s, t)
+                stats["replaced"] += 1
             else:
                 os.rename(s, free_conflict_name(t))
                 stats["conflicts"] += 1
@@ -351,22 +361,32 @@ def merge_into(src: Path, dst: Path) -> dict:
     return stats
 
 
-def resolve_duplicates(issue: Issue, keeper: Path, final_name: str = "") -> str:
-    """Une/elimina todos los demás miembros del grupo en keeper y le pone final_name."""
+def resolve_duplicates(issue: Issue, keeper: Path, final_name: str = "", newest: bool = False) -> str:
+    """Une/elimina todos los demás miembros del grupo en keeper y le pone final_name.
+
+    newest=True: si el contenido difiere, gana la versión más reciente (la otra va a la papelera).
+    """
     if issue.kind != "duplicate":
         raise core.CoreError("No es un duplicado")
     root = local_root()
     keeper = ensure_inside(keeper, root)
     others = [p for p in (ensure_inside(e.path, root) for e in issue.entries) if p != keeper]
-    total = {"moved": 0, "same": 0, "conflicts": 0}
+    total = {"moved": 0, "same": 0, "conflicts": 0, "replaced": 0}
     for o in others:
         if not o.exists():
             continue
         if keeper.is_dir():
-            for k, v in merge_into(o, keeper).items():
+            for k, v in merge_into(o, keeper, newest).items():
                 total[k] += v
         else:
-            if not same_content(o, keeper):
+            if newest and not same_content(o, keeper):
+                if _newer(o, keeper):
+                    trash(keeper)
+                    os.rename(o, keeper)
+                else:
+                    trash(o)
+                total["replaced"] += 1
+            elif not same_content(o, keeper):
                 os.rename(o, free_conflict_name(keeper))
                 total["conflicts"] += 1
             else:
@@ -378,6 +398,55 @@ def resolve_duplicates(issue: Issue, keeper: Path, final_name: str = "") -> str:
     if total["conflicts"]:
         msg += f" · {total['conflicts']} archivo(s) distintos quedan como conflicto para revisar"
     return msg
+
+
+def clean_name(e: Entry) -> str:
+    """Nombre sin «(1)», «(1) (1)»… ni caracteres que Windows/macOS no admiten."""
+    if e.is_dir:
+        return portable_name(DUP_SUFFIX.sub("", e.name))
+    stem, ext = os.path.splitext(e.name)
+    return portable_name(DUP_SUFFIX.sub("", stem) + ext)
+
+
+AUTO_MIN_AGE = 300  # no tocar nada modificado hace menos de 5 min (puede estar en uso)
+
+
+def in_use(e: Entry) -> bool:
+    """Abierto en un editor (LibreOffice, MS Office, vim, emacs) o modificado hace poco."""
+    if e.mtime and datetime.now().timestamp() - e.mtime.timestamp() < AUTO_MIN_AGE:
+        return True
+    d, n = e.path.parent, e.name
+    return any((d / lk).exists() for lk in (f".~lock.{n}#", f"~${n}", f".{n}.swp", f".#{n}"))
+
+
+def auto_clean(issues: list[Issue] | None = None) -> dict:
+    """Resuelve sin preguntar: gana la versión más reciente y el resto va a la papelera.
+
+    Conflictos: se queda la más reciente con el nombre original.
+    Duplicados: se unen en uno con el nombre limpio (sin «(1)» ni «:»).
+    Se salta lo modificado hace poco. Devuelve {"conflicts", "duplicates", "skipped", "errors"}.
+    """
+    issues = scan() if issues is None else issues
+    out = {"conflicts": 0, "duplicates": 0, "skipped": 0, "errors": []}
+    for i in issues:
+        if any(in_use(e) for e in i.entries if e.path.exists()):
+            out["skipped"] += 1
+            continue
+        try:
+            if i.kind == "conflict":
+                orig, copy = i.entries[0].path, i.entries[1].path
+                keep_copy = i.original_missing or (not i.identical and _newer(copy, orig))
+                resolve_conflict(i, "keep_copy" if keep_copy else "keep_original")
+                out["conflicts"] += 1
+            else:
+                keeper = suggested_keeper(i)
+                final = clean_name(keeper)
+                taken = (keeper.path.parent / final).exists() and final not in {e.name for e in i.entries}
+                resolve_duplicates(i, keeper.path, "" if taken else final, newest=True)
+                out["duplicates"] += 1
+        except (core.CoreError, OSError) as e:
+            out["errors"].append(f"{i.title}: {e}")
+    return out
 
 
 # --------------------------------------------------------------- contenido

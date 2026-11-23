@@ -259,7 +259,13 @@ class MainWindow(Adw.ApplicationWindow):
                                        tooltip_text="Abrir en el navegador")
         self.row_drive.add_suffix(Gtk.Image(icon_name="web-browser-symbolic", css_classes=["dim-label"]))
         self.row_drive.connect("activated", lambda *_: self.app.open_drive())
-        for r in (self.row_auto, self.row_next, self.row_last, self.row_drive):
+        self.row_postponed = Adw.ActionRow(title="Esperando a que cierres un archivo", subtitle_lines=3, visible=False)
+        self.row_postponed.add_prefix(Gtk.Image(icon_name="document-edit-symbolic"))
+        b_now = Gtk.Button(label="Sincronizar ya", valign=Gtk.Align.CENTER, css_classes=["flat"],
+                           tooltip_text="Sincroniza aunque el archivo siga abierto")
+        b_now.connect("clicked", lambda *_: self.app.force_sync())
+        self.row_postponed.add_suffix(b_now)
+        for r in (self.row_auto, self.row_next, self.row_last, self.row_postponed, self.row_drive):
             g1.add(r)
         page.add(g1)
 
@@ -373,6 +379,10 @@ class MainWindow(Adw.ApplicationWindow):
                                        + ("" if st.last_ok else " · con errores, revisa Actividad"))
         else:
             self.row_last.set_subtitle("Nunca")
+        self.row_postponed.set_visible(bool(st.postponed) and state != "syncing")
+        if st.postponed:
+            self.row_postponed.set_subtitle(GLib.markup_escape_text(
+                f"«{st.postponed}» está abierto o cambiando. Se sincroniza cuando lo cierres (como mucho, en 1 h)."))
 
     def _show_problem(self, d):
         self._problem = d
@@ -768,8 +778,14 @@ class MainWindow(Adw.ApplicationWindow):
         self._as_handler = self.row_autostart.connect("notify::active", lambda r, _p: self.app.set_autostart(r.get_active()))
         self.row_notify = Adw.SwitchRow(title="Notificaciones", subtitle="Avisar de errores y sincronizaciones manuales", active=True)
         self.row_notify.connect("notify::active", lambda r, _p: self.app.settings_set("notify", r.get_active()))
+        self.row_autoclean = Adw.SwitchRow(
+            title="Limpiar duplicados automáticamente",
+            subtitle="Tras cada sincronización, quita copias «(1)», «(1) (1)»… y conflictos dejando la versión "
+                     "más reciente. Lo quitado va a la papelera (aquí y en Drive).", active=True)
+        self.row_autoclean.connect("notify::active", lambda r, _p: self.app.settings_set("auto_clean", r.get_active()))
         g.add(self.row_autostart)
         g.add(self.row_notify)
+        g.add(self.row_autoclean)
         page.add(g)
 
         self.g_accounts = Adw.PreferencesGroup(title="Cuentas", description="Cuentas de Google Drive conectadas a rclone")
@@ -847,6 +863,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.row_autostart.set_active(core.autostart_enabled())
         self.row_autostart.handler_unblock(self._as_handler)
         self.row_notify.set_active(self.app.settings_get("notify", True))
+        self.row_autoclean.set_active(self.app.settings_get("auto_clean", True))
         self._load_filters()
         self.row_rclone.set_subtitle((self.status.rclone if self.status and self.status.rclone else "No instalado"))
         self._load_accounts()
