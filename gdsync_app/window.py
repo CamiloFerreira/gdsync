@@ -88,6 +88,8 @@ class MainWindow(Adw.ApplicationWindow):
         header.set_title_widget(switcher)
         menu = Gio.Menu()
         menu.append("Abrir carpeta local", "app.open-folder")
+        menu.append("Abrir en Google Drive", "app.open-drive")
+        menu.append("Conflictos y duplicados", "app.conflicts")
         menu.append("Buscar actualizaciones", "app.check-updates")
         menu.append("Acerca de", "app.about")
         menu.append("Salir", "app.quit")
@@ -214,6 +216,17 @@ class MainWindow(Adw.ApplicationWindow):
         g0.add(hero)
         page.add(g0)
 
+        # -- conflictos y duplicados pendientes de decidir
+        self.g_issues = Adw.PreferencesGroup(visible=False)
+        self.row_issues = Adw.ActionRow(title="Conflictos y duplicados", activatable=True)
+        self.row_issues.add_prefix(Gtk.Image(icon_name="dialog-warning-symbolic", css_classes=["warning"]))
+        b_rev = Gtk.Button(label="Revisar", valign=Gtk.Align.CENTER, css_classes=["suggested-action"])
+        b_rev.connect("clicked", lambda *_: self.app.show_resolver())
+        self.row_issues.add_suffix(b_rev)
+        self.row_issues.connect("activated", lambda *_: self.app.show_resolver())
+        self.g_issues.add(self.row_issues)
+        page.add(self.g_issues)
+
         # -- qué pasó y cómo arreglarlo (solo con error)
         self.g_problem = Adw.PreferencesGroup(visible=False)
         self.row_problem = Adw.ActionRow(css_classes=["error"], title_lines=2, subtitle_lines=4)
@@ -242,12 +255,11 @@ class MainWindow(Adw.ApplicationWindow):
         self.row_auto.add_suffix(self.b_pause)
         self.row_next = Adw.ActionRow(title="Próxima ejecución", subtitle="—")
         self.row_last = Adw.ActionRow(title="Última sincronización", subtitle="—")
-        self.row_conflicts = Adw.ActionRow(title="Archivos con conflicto", subtitle_lines=3, visible=False)
-        self.row_conflicts.add_prefix(Gtk.Image(icon_name="dialog-warning-symbolic", css_classes=["warning"]))
-        b_conf = Gtk.Button(label="Ver", valign=Gtk.Align.CENTER)
-        b_conf.connect("clicked", lambda *_: self.show_changes())
-        self.row_conflicts.add_suffix(b_conf)
-        for r in (self.row_auto, self.row_next, self.row_last, self.row_conflicts):
+        self.row_drive = Adw.ActionRow(title="Carpeta en Google Drive", subtitle="—", activatable=True,
+                                       tooltip_text="Abrir en el navegador")
+        self.row_drive.add_suffix(Gtk.Image(icon_name="web-browser-symbolic", css_classes=["dim-label"]))
+        self.row_drive.connect("activated", lambda *_: self.app.open_drive())
+        for r in (self.row_auto, self.row_next, self.row_last, self.row_drive):
             g1.add(r)
         page.add(g1)
 
@@ -338,6 +350,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.hero_title.set_label(title)
         self.chip_remote.set_label(f"{c['REMOTE_NAME']}:{core.remote_label(c['REMOTE_PATH'])}")
         self.chip_local.set_label(c["LOCAL_PATH"].replace(str(core.HOME), "~", 1))
+        self.row_drive.set_subtitle(GLib.markup_escape_text(f"Mi unidad / {c['REMOTE_PATH']}"))
         self.b_sync.set_sensitive(not job_running)
         self.b_dry.set_sensitive(not job_running)
         self._set_auto(st.timer_enabled)
@@ -384,6 +397,13 @@ class MainWindow(Adw.ApplicationWindow):
             self.app.open_folder()
         elif d.action == "url" and d.url:
             Gtk.UriLauncher.new(d.url).launch(self, None, None)
+
+    def update_issues(self, issues: list):
+        nc = sum(1 for i in issues if i.kind == "conflict")
+        nd = len(issues) - nc
+        parts = ([f"{nc} conflicto(s)"] if nc else []) + ([f"{nd} duplicado(s)"] if nd else [])
+        self.g_issues.set_visible(bool(issues))
+        self.row_issues.set_subtitle(GLib.markup_escape_text(" · ".join(parts) + " · decide qué conservar"))
 
     def update_quota(self, remote: str, q: dict | None, err: str | None = None):
         self._quota = (remote, q) if q and not err else None
@@ -713,13 +733,6 @@ class MainWindow(Adw.ApplicationWindow):
             row.add_prefix(img)
             row._path = c.path
             self.changes_list.append(row)
-        conflicts = [c for c in t.changes if c.kind == "conflict"]
-        self.row_conflicts.set_visible(bool(conflicts))
-        if conflicts:
-            n = len(conflicts)
-            self.row_conflicts.set_title(f"{n} archivo{'s' if n > 1 else ''} con conflicto")
-            self.row_conflicts.set_subtitle("Se editaron en ambos lados. Quedó la versión más nueva y la otra se guardó "
-                                            "como copia «.conflictN» junto a ella. Revísalas y borra la que sobre.")
 
     def _open_change(self, row):
         lp = (self.status.config if self.status else core.read_config()).get("LOCAL_PATH")

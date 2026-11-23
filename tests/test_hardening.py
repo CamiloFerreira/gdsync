@@ -28,7 +28,7 @@ FAKEBIN.mkdir()
 os.environ["PATH"] = f"{FAKEBIN}:{os.environ['PATH']}"
 sys.path.insert(0, str(ROOT))
 
-from gdsync_app import core, updater  # noqa: E402
+from gdsync_app import conflicts, core, updater  # noqa: E402
 
 HOME = Path(os.environ["HOME"])
 GDSYNC = str(ROOT / "gdsync")
@@ -437,6 +437,148 @@ class TestUpdater(unittest.TestCase):
 
     def test_parse_version(self):
         self.assertGreater(updater.parse_version("1.10.0"), updater.parse_version("1.9.9"))
+
+
+class TestConflicts(unittest.TestCase):
+    def setUp(self):
+        import shutil
+        self.root = HOME / "Sync"
+        shutil.rmtree(self.root, ignore_errors=True)
+        self.root.mkdir()
+        self.trash = TMP / "trash"
+        shutil.rmtree(self.trash, ignore_errors=True)
+        self.trash.mkdir()
+        core.write_config({"REMOTE_NAME": "gdrive", "REMOTE_PATH": "X", "LOCAL_PATH": str(self.root), "INTERVAL": "5min"})
+        self._orig_trash = conflicts.TRASH
+        conflicts.TRASH = lambda p: os.rename(p, self.trash / f"{len(os.listdir(self.trash))}-{p.name}")
+
+    def tearDown(self):
+        conflicts.TRASH = self._orig_trash
+
+    def w(self, rel, text):
+        p = self.root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+        return p
+
+    def test_conflict_name_parsing(self):
+        self.assertEqual(conflicts.conflict_original("doc.conflict1.txt"), "doc.txt")
+        self.assertEqual(conflicts.conflict_original("a.burp.conflict12"), "a.burp")
+        self.assertEqual(conflicts.conflict_original("README.conflict2"), "README")
+        self.assertIsNone(conflicts.conflict_original("conflicto.txt"))
+        self.assertIsNone(conflicts.conflict_original("doc.txt"))
+
+    def test_scan_finds_conflicts_and_duplicates(self):
+        self.w("a/doc.txt", "uno")
+        self.w("a/doc.conflict1.txt", "dos")
+        self.w("a/same.txt", "x")
+        self.w("a/same.conflict1.txt", "x")
+        self.w("P: informe/f.txt", "1")
+        self.w("P  informe/f.txt", "1")
+        self.w("P  informe (1) (1)/f.txt", "1")
+        self.w("fotos/foto (1).jpg", "a")   # sin base: no es duplicado
+        self.w("fotos/foto (2).jpg", "b")
+        issues = conflicts.scan()
+        conf = {i.entries[1].name: i for i in issues if i.kind == "conflict"}
+        self.assertEqual(set(conf), {"doc.conflict1.txt", "same.conflict1.txt"})
+        self.assertFalse(conf["doc.conflict1.txt"].identical)
+        self.assertTrue(conf["same.conflict1.txt"].identical)
+        dups = [i for i in issues if i.kind == "duplicate"]
+        self.assertEqual(len(dups), 1)
+        self.assertEqual(len(dups[0].entries), 3)
+        self.assertTrue(dups[0].identical)
+        self.assertEqual(conflicts.suggested_keeper(dups[0]).name, "P  informe")
+
+    def test_resolve_conflict_actions(self):
+        orig, copy = self.w("doc.txt", "nuevo"), self.w("doc.conflict1.txt", "viejo")
+        issue = next(i for i in conflicts.scan() if i.kind == "conflict")
+        conflicts.resolve_conflict(issue, "keep_copy")
+        self.assertEqual(orig.read_text(), "viejo")
+        self.assertFalse(copy.exists())
+        self.assertEqual(len(os.listdir(self.trash)), 1)
+
+        self.w("doc.conflict1.txt", "otro")
+        issue = next(i for i in conflicts.scan() if i.kind == "conflict")
+        conflicts.resolve_conflict(issue, "keep_both", "doc (otro).txt")
+        self.assertEqual((self.root / "doc (otro).txt").read_text(), "otro")
+        self.assertEqual(orig.read_text(), "viejo")
+
+        self.w("doc.conflict1.txt", "zzz")
+        issue = next(i for i in conflicts.scan() if i.kind == "conflict")
+        with self.assertRaises(core.CoreError):
+            conflicts.resolve_conflict(issue, "keep_both", "../fuera.txt")
+        conflicts.resolve_conflict(issue, "keep_original")
+        self.assertFalse((self.root / "doc.conflict1.txt").exists())
+        self.assertEqual([i for i in conflicts.scan() if i.kind == "conflict"], [])
+
+    def test_merge_duplicates(self):
+        self.w("R/a.txt", "igual")
+        self.w("R/b.txt", "uno")
+        self.w("R:/a.txt", "igual")
+        self.w("R:/b.txt", "dos")
+        self.w("R:/sub/c.txt", "nuevo")
+        issue = next(i for i in conflicts.scan() if i.kind == "duplicate")
+        conflicts.resolve_duplicates(issue, self.root / "R", "R final")
+        dst = self.root / "R final"
+        self.assertFalse((self.root / "R:").exists())
+        self.assertEqual((dst / "sub/c.txt").read_text(), "nuevo")
+        self.assertEqual((dst / "b.txt").read_text(), "uno")
+        self.assertEqual((dst / "b.conflict1.txt").read_text(), "dos")
+        self.assertEqual(sorted(p.name for p in dst.iterdir()), ["a.txt", "b.conflict1.txt", "b.txt", "sub"])
+
+    def test_actions_stay_inside_sync_folder(self):
+        outside = HOME / "fuera.txt"
+        outside.write_text("no tocar")
+        (self.root / "link").symlink_to(HOME)
+        for p in (outside, self.root, self.root / "link" / "fuera.txt", self.root / ".." / "fuera.txt"):
+            with self.subTest(p=p), self.assertRaises(core.CoreError):
+                conflicts.trash(p)
+        self.assertTrue(outside.exists())
+        for bad in ("", "a/b", "..", ".", "x\nExec"):
+            with self.subTest(bad=bad), self.assertRaises(core.CoreError):
+                conflicts.valid_name(bad)
+
+    def test_portable_name(self):
+        self.assertEqual(conflicts.portable_name("A: b?.txt"), "A  b.txt")
+        self.assertEqual(conflicts.portable_name("APP "), "APP")
+        self.assertTrue(conflicts.non_portable("APP "))
+        self.assertTrue(conflicts.non_portable("x .burp"))
+        self.assertFalse(conflicts.non_portable("Informe final.pdf"))
+
+    def test_preview(self):
+        self.w("t.txt", "hola ñ")
+        self.assertEqual(conflicts.preview(self.root / "t.txt"), {"kind": "text", "text": "hola ñ", "truncated": False})
+        (self.root / "b.bin").write_bytes(b"\x00\x01\x02")
+        self.assertEqual(conflicts.preview(self.root / "b.bin")["kind"], "binary")
+        (self.root / "i.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 20)
+        self.assertEqual(conflicts.preview(self.root / "i.png")["kind"], "image")
+
+    def test_drive_url(self):
+        fake = HOME / ".local/bin/rclone"
+        fake.parent.mkdir(parents=True, exist_ok=True)
+        fake.write_text("#!/bin/sh\ncase \"$*\" in "
+                        "*--dirs-only*) echo '[{\"Name\":\"sub\",\"ID\":\"1AbCdEfGhIjKl\",\"IsDir\":true},"
+                        "{\"Name\":\"X\",\"ID\":\"1RootRootRoot\",\"IsDir\":true}]';; "
+                        "*--files-only*) echo '[{\"Name\":\"x.txt\",\"ID\":\"1ZyXwVuTsRqP\"},"
+                        "{\"Name\":\"evil\",\"ID\":\"../x?y\"}]';; "
+                        "*) exit 3;; esac\n")
+        fake.chmod(0o755)
+        try:
+            (self.root / "sub").mkdir()
+            self.w("x.txt", "1")
+            self.w("evil", "1")
+            self.assertEqual(conflicts.drive_url(self.root / "sub"), "https://drive.google.com/drive/folders/1AbCdEfGhIjKl")
+            self.assertEqual(conflicts.drive_url(self.root / "x.txt"), "https://drive.google.com/file/d/1ZyXwVuTsRqP/view")
+            with self.assertRaises(core.CoreError):
+                conflicts.drive_url(self.root / "evil")
+            self.assertEqual(conflicts.drive_url(), "https://drive.google.com/drive/folders/1RootRootRoot")
+            self.w("nuevo.txt", "1")
+            with self.assertRaises(core.CoreError):
+                conflicts.drive_url(self.root / "nuevo.txt")
+            with self.assertRaises(core.CoreError):
+                conflicts.drive_url(HOME / "fuera.txt")
+        finally:
+            fake.unlink()
 
 
 if __name__ == "__main__":

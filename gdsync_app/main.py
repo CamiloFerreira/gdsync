@@ -13,7 +13,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
-from . import __version__, core, updater  # noqa: E402
+from . import __version__, conflicts, core, updater  # noqa: E402
 from .tray import MenuItem, Tray  # noqa: E402
 from .window import MainWindow, bg  # noqa: E402
 
@@ -47,6 +47,10 @@ class App(Adw.Application):
         self._mandatory_dlg = None
         self._updating = False
         self._checking = False
+        self.issues: list = []
+        self._issue_keys: set | None = None
+        self._scanning = False
+        self.resolver = None
 
     # --------------------------------------------------------- arranque
     def do_startup(self):
@@ -56,6 +60,8 @@ class App(Adw.Application):
         for name, cb in (("quit", lambda *_: self.quit_app()), ("open-folder", lambda *_: self.open_folder()),
                          ("about", lambda *_: self.about()), ("show", lambda *_: self.show_window()),
                          ("sync", lambda *_: self.start_job("sync")),
+                         ("conflicts", lambda *_: self.show_resolver()),
+                         ("open-drive", lambda *_: self.open_drive()),
                          ("check-updates", lambda *_: self.check_updates_now()),
                          ("pause-1h", lambda *_: self.pause_sync(3600)),
                          ("pause-tomorrow", lambda *_: self.pause_sync(core.seconds_until_tomorrow()))):
@@ -75,6 +81,7 @@ class App(Adw.Application):
         core.LogFollower(lambda lines: GLib.idle_add(self._on_log_lines, lines))
         self.refresh()
         GLib.timeout_add_seconds(4, self._poll)
+        GLib.timeout_add_seconds(2, lambda: self.scan_issues() and False)
         # Actualizaciones: caché al instante (funciona offline), red a los 3 s y cada 6 h
         cached = updater.cached()
         if cached:
@@ -175,11 +182,14 @@ class App(Adw.Application):
             items.append(MenuItem("Buscar actualizaciones", self.check_updates_now, enabled=not self._checking))
         if st and st.last_sync:
             items.append(MenuItem(f"Última: {core.fmt_rel(st.last_sync)}", enabled=False))
+        if self.issues:
+            items.append(MenuItem(f"Resolver conflictos ({len(self.issues)})…", self.show_resolver))
         items += [
             MenuItem(separator=True),
             MenuItem("Abrir gdsync", self.show_window),
             MenuItem("Sincronizar ahora", lambda: self.start_job("sync"), enabled=configured and not busy),
             MenuItem("Abrir carpeta local", self.open_folder, enabled=configured),
+            MenuItem("Abrir en Google Drive", self.open_drive, enabled=configured),
             MenuItem("Sincronización automática", self._tray_toggle_timer, enabled=configured,
                      toggle=bool(st and st.timer_enabled)),
         ]
@@ -255,6 +265,8 @@ class App(Adw.Application):
             self.win.load_folder_page()
         if job.kind in ("sync", "resync", "install-rclone"):
             self._quota_remote = None
+        if job.kind in ("sync", "resync"):
+            GLib.timeout_add_seconds(2, lambda: self.scan_issues() and False)
         self.refresh()
 
     def cancel_job(self):
@@ -409,6 +421,57 @@ class App(Adw.Application):
         # Releer update.json justo antes: la info en memoria puede tener hashes viejos
         bg(lambda: updater.apply(updater.check() or info, progress), done, fail)
 
+    # ------------------------------------------------- conflictos/duplicados
+    def sync_busy(self) -> bool:
+        return self._syncing()
+
+    def scan_issues(self):
+        if self._scanning or not core.is_configured():
+            return
+        if self._syncing():  # los archivos cambian mientras sincroniza: reintentar luego
+            GLib.timeout_add_seconds(10, lambda: self.scan_issues() and False)
+            return
+        self._scanning = True
+
+        def done(issues):
+            self._scanning = False
+            self.set_issues(issues)
+
+        def fail(_e):
+            self._scanning = False
+        bg(conflicts.scan, done, fail)
+
+    def set_issues(self, issues: list):
+        keys = {i.key for i in issues}
+        new = keys - (self._issue_keys or set())
+        if self._issue_keys is not None and new:
+            n = len(new)
+            self.notify("Conflicto por revisar" if n == 1 else f"{n} conflictos por revisar",
+                        "Hay archivos en conflicto o duplicados. Abre gdsync para decidir qué conservar.")
+        self._issue_keys = keys
+        self.issues = issues
+        self.win.update_issues(issues)
+        self._menu_sig = None
+        self._build_tray_menu()
+
+    def on_issues_changed(self):
+        self.refresh()
+
+    def show_resolver(self):
+        from .resolver import ResolverDialog
+        self.show_window()
+        if self.resolver is not None:
+            self.resolver.rescan()
+            return
+        self.resolver = ResolverDialog(self)
+        self.resolver.connect("closed", lambda *_: setattr(self, "resolver", None))
+        self.resolver.present(self.win)
+
+    def open_drive(self, path=None):
+        def done(url):
+            Gtk.UriLauncher.new(url).launch(self.win if self.win.get_visible() else None, None, None)
+        bg(lambda: conflicts.drive_url(path), done, lambda e: (self.win.error(e), self.notify("Google Drive", str(e))))
+
     def open_folder(self):
         lp = core.read_config()["LOCAL_PATH"]
         if lp:
@@ -463,6 +526,8 @@ class App(Adw.Application):
         # cambios en el log suelen indicar inicio/fin de sync automático
         if any("Bisync successful" in l or "Bisync aborted" in l or "bisync is IN BETA" in l or "Synching Path1" in l for l in lines):
             self.refresh()
+        if any("Bisync successful" in l for l in lines):
+            GLib.timeout_add_seconds(3, lambda: self.scan_issues() and False)
 
 
 def main():
