@@ -538,7 +538,7 @@ def diagnose(lines: list[str]) -> Diagnosis:
         return Diagnosis("Hay que volver a conectar tu cuenta",
                          "Google rechazó el acceso (la autorización venció o se revocó).",
                          "reauth", "Reconectar cuenta")
-    if "permission denied" in low:
+    if "permission denied" in low or (m and "sin permiso" in m.group(1).lower()):
         p = re.search(r"open ([^:]+): permission denied|([^ ]+): permission denied", text)
         where = (p.group(1) or p.group(2)) if p else ""
         return Diagnosis("Sin permiso para escribir en la carpeta local",

@@ -261,6 +261,23 @@ check_mounted() {
   die "El disco de $1 no está conectado (o no está montado). Conéctalo y vuelve a sincronizar."
 }
 
+# En discos NTFS/exFAT las carpetas pueden volver como solo lectura tras
+# reiniciar (atributo de solo lectura de Windows, ACL del montaje). Si los
+# archivos son del usuario, se arreglan con chmod sin pedir contraseña.
+# Nunca sigue enlaces simbólicos (chmod cambiaría el destino).
+fix_permissions() {
+  local n
+  n="$(find "$1" -user "$(id -u)" ! -type l \
+         \( -type d ! -perm -u=rwx -o ! -type d ! -perm -u=rw \) \
+         -print -exec chmod u+rwX {} + 2>/dev/null | wc -l)"
+  if (( n > 0 )); then
+    info "Permisos de escritura restaurados en $n elementos de $1"
+    printf '%s gdsync INFO: permisos de escritura restaurados en %s elementos\n' \
+      "$(date '+%Y/%m/%d %H:%M:%S')" "$n" >> "$LOG_FILE"
+  fi
+  [[ -w "$1" ]] || die "Sin permiso para escribir en $1 (es de otro usuario o está montada en solo lectura)."
+}
+
 bisync() {
   load_config
   [[ -n "$REMOTE_PATH" && -n "$LOCAL_PATH" ]] || die "Sin carpeta configurada. Ejecuta: $APP choose"
@@ -268,6 +285,7 @@ bisync() {
   ensure_filters
   check_mounted "$LOCAL_PATH"
   mkdir -p "$STATE_DIR/bisync" "$LOCAL_PATH"
+  [[ " $* " == *" --dry-run "* ]] || fix_permissions "$LOCAL_PATH"
   # Rotación simple del log (5 MB)
   if [[ -f "$LOG_FILE" ]] && (( $(stat -c %s "$LOG_FILE") > 5242880 )); then
     mv -f "$LOG_FILE" "$LOG_FILE.1"

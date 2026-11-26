@@ -202,6 +202,7 @@ class TestDiagnose(unittest.TestCase):
             "quota": ("url", ["ERROR : googleapi: Error 403: Quota exceeded for quota metric", "Bisync aborted"]),
             "net": (None, ["ERROR : dial tcp: lookup www.googleapis.com: no such host", "Bisync aborted"]),
             "disk": ("open-folder", ["2026/11/15 10:00:00 gdsync ERROR: El disco de /mnt/x no está conectado"]),
+            "perm": ("open-folder", ["2026/11/15 10:00:00 gdsync ERROR: Sin permiso para escribir en /mnt/x"]),
         }
         for name, (action, lines) in cases.items():
             with self.subTest(name):
@@ -215,6 +216,29 @@ class TestDiagnose(unittest.TestCase):
             self.assertIs(core.get_status().last_ok, False)
         finally:
             core.LOG_FILE.unlink()
+
+
+class TestFixPermissions(unittest.TestCase):
+    def test_restores_write_without_following_symlinks(self):
+        base = TMP / "perm"
+        (base / "d/sub").mkdir(parents=True)
+        (base / "d/f.txt").write_text("x")
+        outside = TMP / "outside.txt"
+        outside.write_text("x")
+        outside.chmod(0o444)
+        (base / "d/link").symlink_to(outside)
+        (base / "d/f.txt").chmod(0o444)
+        (base / "d/sub").chmod(0o555)
+        (base / "d").chmod(0o555)
+        log = TMP / "perm.log"
+        src = (f"source <(sed -n '/^info()/p;/^die()/p;/^fix_permissions()/,/^}}/p' {GDSYNC}); "
+               f"LOG_FILE={log}; fix_permissions \"$1\"")
+        r = subprocess.run(["bash", "-c", src, "_", str(base)], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for p, bits in (("d", stat.S_IWUSR | stat.S_IXUSR), ("d/sub", stat.S_IWUSR), ("d/f.txt", stat.S_IWUSR)):
+            self.assertTrue((base / p).stat().st_mode & bits, p)
+        self.assertFalse(outside.stat().st_mode & stat.S_IWUSR)
+        self.assertIn("restaurados en 3", log.read_text())
 
 
 class TestTracker(unittest.TestCase):
